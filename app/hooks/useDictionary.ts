@@ -69,6 +69,7 @@ export default function useDictionary() {
         t("Uploading… {{ progress }}%", { progress }),
       imageCaptionPlaceholder: t("Write a caption"),
       info: t("Info"),
+      kanban: t("Kanban board"),
       infoNotice: t("Info notice"),
       link: t("Link"),
       linkCopied: t("Link copied to clipboard"),

@@ -146,6 +146,12 @@ export default function blockMenuItems(
       },
     },
     {
+      name: "kanban",
+      title: dictionary.kanban,
+      icon: <TableIcon />,
+      keywords: "kanban board task project",
+    },
+    {
       name: "blockquote",
       title: dictionary.quote,
       icon: <BlockQuoteIcon />,

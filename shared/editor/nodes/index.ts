@@ -28,6 +28,7 @@ import HardBreak from "./HardBreak";
 import Heading from "./Heading";
 import HorizontalRule from "./HorizontalRule";
 import Image from "./Image";
+import Kanban from "./Kanban";
 import ListItem from "./ListItem";
 import Math from "./Math";
 import MathBlock from "./MathBlock";
@@ -102,6 +103,7 @@ export const basicExtensions: Nodes = [...inlineExtensions, ...listExtensions];
 export const richExtensions: Nodes = [
   ...inlineExtensions.filter((n) => n !== SimpleImage),
   Image,
+  Kanban,
   CodeBlock,
   CodeFence,
   Blockquote,
