@@ -306,6 +306,15 @@ export function CodeHighlighting({
         decorations.push(...lineNumberDecorations(block));
       }
 
+      // Keep text wrapped when syntax token classes change beside line numbers.
+      if (lineNumbers && node.content.size) {
+        decorations.push(
+          Decoration.inline(pos + 1, pos + node.nodeSize - 1, {
+            nodeName: "span",
+          })
+        );
+      }
+
       if (
         previous &&
         !tokenCache.has(node) &&
