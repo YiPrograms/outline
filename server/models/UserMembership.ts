@@ -1,5 +1,12 @@
 import type { InferAttributes, InferCreationAttributes } from "sequelize";
-import { Op, type SaveOptions, type FindOptions } from "sequelize";
+import {
+  Op,
+  type CreateOptions,
+  type FindOptions,
+  type InstanceDestroyOptions,
+  type SaveOptions,
+  type Transaction,
+} from "sequelize";
 import type { WhereOptions } from "sequelize";
 import {
   Column,
@@ -20,6 +27,8 @@ import {
 import type { DocumentPermission } from "@shared/types";
 import { CollectionPermission } from "@shared/types";
 import { ValidationError } from "@server/errors";
+import { LockHelper } from "@server/storage/LockHelper";
+import { afterCommit } from "@server/storage/transaction";
 import type { APIContext } from "@server/types";
 import { CacheHelper } from "@server/utils/CacheHelper";
 import { RedisPrefixHelper } from "@server/utils/RedisPrefixHelper";
@@ -29,7 +38,6 @@ import GroupMembership from "./GroupMembership";
 import User from "./User";
 import IdModel from "./base/IdModel";
 import type { HookContext } from "./base/Model";
-import Fix from "./decorators/Fix";
 
 /**
  * Represents a users's permission to access a collection or document.
@@ -68,7 +76,6 @@ import Fix from "./decorators/Fix";
   },
 }))
 @Table({ tableName: "user_permissions", modelName: "user_permission" })
-@Fix
 class UserMembership extends IdModel<
   InferAttributes<UserMembership>,
   Partial<InferCreationAttributes<UserMembership>>
@@ -84,7 +91,7 @@ class UserMembership extends IdModel<
     max: 256,
     msg: `index must be 256 characters or less`,
   })
-  @Column
+  @Column(DataType.STRING)
   index: string | null;
 
   // associations
@@ -135,6 +142,38 @@ class UserMembership extends IdModel<
   createdById: string;
 
   // static methods
+
+  /**
+   * Find the membership of a user on a collection or document and lock it for
+   * the remainder of the transaction. The lock is held even when no membership
+   * exists, so that concurrent grants cannot each create a membership.
+   *
+   * @param where the user and the collection or document of the membership.
+   * @param options additional options to pass to the query, with a transaction.
+   * @returns a promise that resolves to the membership, or null.
+   */
+  public static async findOneForUpdate(
+    where: {
+      userId: string;
+      collectionId?: string | null;
+      documentId?: string | null;
+    },
+    options: FindOptions<UserMembership> & { transaction: Transaction }
+  ) {
+    const { userId, collectionId, documentId } = where;
+    const targetId = collectionId ?? documentId;
+    await LockHelper.acquire(
+      this.sequelize!,
+      `userMembership:${targetId}:${userId}`.toLowerCase(),
+      options.transaction
+    );
+
+    return this.findOne({
+      ...options,
+      where: collectionId ? { userId, collectionId } : { userId, documentId },
+      lock: options.transaction.LOCK.UPDATE,
+    });
+  }
 
   /**
    * Copy user memberships from one document to another.
@@ -193,7 +232,7 @@ class UserMembership extends IdModel<
       memberships.map((membership) =>
         membership?.sourceId
           ? this.findByPk(membership.sourceId, options)
-          : membership
+          : Promise.resolve(membership)
       )
     );
 
@@ -205,7 +244,10 @@ class UserMembership extends IdModel<
   @AfterCreate
   static async createSourcedMemberships(
     model: UserMembership,
-    options: SaveOptions<UserMembership> & { documentId?: string }
+    options: SaveOptions<UserMembership> & {
+      documentId?: string;
+      childDocumentIds?: string[];
+    }
   ) {
     if (model.sourceId || !model.documentId) {
       return;
@@ -225,11 +267,17 @@ class UserMembership extends IdModel<
   }
 
   @AfterCreate
-  static async invalidateCollectionIdsAfterCreate(model: UserMembership) {
-    if (model.collectionId) {
-      await CacheHelper.clearData(
-        RedisPrefixHelper.getUserCollectionIdsKey(model.userId)
-      );
+  static async invalidateCollectionIdsAfterCreate(
+    model: UserMembership,
+    options: CreateOptions<UserMembership>
+  ) {
+    await this.invalidateCollectionIds(model, options);
+  }
+
+  @AfterCreate
+  static async invalidateDocumentIdsAfterCreate(model: UserMembership) {
+    if (model.documentId) {
+      await Document.invalidateMembershipDocumentIds([model.userId]);
     }
   }
 
@@ -309,43 +357,55 @@ class UserMembership extends IdModel<
   }
 
   @AfterDestroy
-  static async invalidateCollectionIdsAfterDestroy(model: UserMembership) {
-    if (model.collectionId) {
-      await CacheHelper.clearData(
-        RedisPrefixHelper.getUserCollectionIdsKey(model.userId)
-      );
+  static async invalidateCollectionIdsAfterDestroy(
+    model: UserMembership,
+    options: InstanceDestroyOptions
+  ) {
+    await this.invalidateCollectionIds(model, options);
+  }
+
+  @AfterDestroy
+  static async invalidateDocumentIdsAfterDestroy(model: UserMembership) {
+    if (model.documentId) {
+      await Document.invalidateMembershipDocumentIds([model.userId]);
     }
   }
 
   /**
    * Recreate all sourced permissions for a given permission.
+   *
+   * @param model the source membership.
+   * @param options the save options, with an optional target document id and
+   * precomputed published child document ids of the target document.
    */
   static async recreateSourcedMemberships(
     model: UserMembership,
-    options: SaveOptions<UserMembership> & { documentId?: string }
+    options: SaveOptions<UserMembership> & {
+      documentId?: string;
+      childDocumentIds?: string[];
+    }
   ) {
     if (!model.documentId) {
       return;
     }
     const { transaction, documentId } = options;
+    let { childDocumentIds } = options;
 
-    const document = await Document.unscoped()
-      .scope("withoutState")
-      .findOne({
-        attributes: ["id"],
-        where: {
-          id: documentId ?? model.documentId,
-        },
-        transaction,
-      });
+    if (!childDocumentIds) {
+      const document = await Document.unscoped()
+        .scope("withoutState")
+        .findOne({
+          attributes: ["id"],
+          where: {
+            id: documentId ?? model.documentId,
+          },
+          transaction,
+        });
+      if (!document) {
+        return;
+      }
 
-    if (!document) {
-      return;
-    }
-
-    const childDocumentIds = [
-      ...(documentId ? [documentId] : []),
-      ...(await document.findAllChildDocumentIds(
+      childDocumentIds = await document.findAllChildDocumentIds(
         {
           publishedAt: {
             [Op.ne]: null,
@@ -354,39 +414,43 @@ class UserMembership extends IdModel<
         {
           transaction,
         }
-      )),
-    ];
-
-    if (childDocumentIds.length) {
-      await this.destroy({
-        where: {
-          userId: model.userId,
-          sourceId: model.id,
-          documentId: {
-            [Op.in]: childDocumentIds,
-          },
-        },
-        transaction,
-      });
-    }
-
-    for (const childDocumentId of childDocumentIds) {
-      await this.create(
-        {
-          documentId: childDocumentId,
-          userId: model.userId,
-          permission: model.permission,
-          sourceId: model.id,
-          createdById: model.createdById,
-          createdAt: model.createdAt,
-          updatedAt: model.updatedAt,
-        },
-        {
-          transaction,
-          hooks: false,
-        }
       );
     }
+
+    const documentIds = [
+      ...(documentId ? [documentId] : []),
+      ...childDocumentIds,
+    ];
+    if (!documentIds.length) {
+      return;
+    }
+
+    await this.destroy({
+      where: {
+        userId: model.userId,
+        sourceId: model.id,
+        documentId: {
+          [Op.in]: documentIds,
+        },
+      },
+      transaction,
+    });
+
+    await this.bulkCreate(
+      documentIds.map((childDocumentId) => ({
+        documentId: childDocumentId,
+        userId: model.userId,
+        permission: model.permission,
+        sourceId: model.id,
+        createdById: model.createdById,
+        createdAt: model.createdAt,
+        updatedAt: model.updatedAt,
+      })),
+      {
+        transaction,
+        hooks: false,
+      }
+    );
   }
 
   private async insertEvent(
@@ -406,10 +470,34 @@ class UserMembership extends IdModel<
     }
   }
 
+  private static async invalidateCollectionIds(
+    model: UserMembership,
+    options: { transaction?: Transaction | null }
+  ) {
+    if (!model.collectionId) {
+      return;
+    }
+
+    await afterCommit(options.transaction, () =>
+      CacheHelper.removeData(
+        RedisPrefixHelper.getUserCollectionIdsKey(model.userId)
+      )
+    );
+  }
+
   private static async validateLastAdminPermission(
     model: UserMembership,
     { transaction }: APIContext["context"]
   ) {
+    // Both models guard the same invariant, so they share one lock name,
+    // otherwise the last user manager and the last group manager can be
+    // removed at the same time.
+    await LockHelper.acquire(
+      model.sequelize,
+      `collectionAdmins:${model.collectionId}`,
+      transaction
+    );
+
     const [userMemberships, groupMemberships] = await Promise.all([
       this.count({
         where: {

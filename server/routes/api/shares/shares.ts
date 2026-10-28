@@ -1,14 +1,28 @@
-import Router from "koa-router";
-import isUndefined from "lodash/isUndefined";
+import Router from "@koa/router";
 import type { FindOptions, WhereAttributeHash, WhereOptions } from "sequelize";
 import { Op } from "sequelize";
-import { TeamPreference } from "@shared/types";
-import { AuthenticationError, NotFoundError } from "@server/errors";
+import { randomString } from "@shared/random";
+import { errToId } from "@shared/utils/error";
+import { QueryNotices, TeamPreference } from "@shared/types";
+import {
+  AuthenticationError,
+  InvalidRequestError,
+  NotFoundError,
+} from "@server/errors";
+import ShareSubscriptionConfirmEmail from "@server/emails/templates/ShareSubscriptionConfirmEmail";
 import auth from "@server/middlewares/authentication";
 import { rateLimiter } from "@server/middlewares/rateLimiter";
 import { transaction } from "@server/middlewares/transaction";
 import validate from "@server/middlewares/validate";
-import { Document, User, Share, Team, Collection } from "@server/models";
+import {
+  Document,
+  User,
+  Share,
+  Team,
+  Collection,
+  ShareSubscription,
+} from "@server/models";
+import ShareSubscriptionHelper from "@server/models/helpers/ShareSubscriptionHelper";
 import { authorize, cannot } from "@server/policies";
 import {
   presentShare,
@@ -20,6 +34,7 @@ import {
 import type { APIContext } from "@server/types";
 import { RateLimiterStrategy } from "@server/utils/RateLimiter";
 import { getTeamFromContext } from "@server/utils/passport";
+import { QueryHelper } from "@server/storage/QueryHelper";
 import { navigationNodeToSitemap } from "@server/utils/sitemap";
 import pagination from "../middlewares/pagination";
 import * as T from "./schema";
@@ -28,6 +43,8 @@ import {
   loadShareWithParent,
 } from "@server/commands/shareLoader";
 import shareDomains from "@server/middlewares/shareDomains";
+import env from "@server/env";
+import { safeEqual } from "@server/utils/crypto";
 
 const router = new Router();
 
@@ -39,7 +56,7 @@ router.post(
     const { id, collectionId, documentId } = ctx.input.body;
     const { user } = ctx.state.auth;
     const teamFromCtx = await getTeamFromContext(ctx, {
-      includeStateCookie: false,
+      includeOAuthState: false,
     });
 
     // only public link loads will send "id".
@@ -63,31 +80,35 @@ router.post(
 
       const team = teamFromCtx?.id === share.teamId ? teamFromCtx : share.team;
 
-      const [serializedCollection, serializedDocument, serializedTeam] =
-        await Promise.all([
-          collection
-            ? await presentCollection(ctx, collection, {
-                isPublic: cannot(user, "read", collection),
-                shareId: share.id,
-                includeUpdatedAt: share.showLastUpdated,
-              })
-            : null,
-          document
-            ? await presentDocument(ctx, document, {
-                isPublic: cannot(user, "read", document),
-                shareId: share.id,
-                includeUpdatedAt: share.showLastUpdated,
-              })
-            : null,
-          presentPublicTeam(
-            team,
-            !!team.getPreference(TeamPreference.PublicBranding)
-          ),
-        ]);
+      const [serializedCollection, serializedDocument] = await Promise.all([
+        collection
+          ? presentCollection(ctx, collection, {
+              isPublic: cannot(user, "read", collection),
+              shareId: share.id,
+              includeUpdatedAt: share.showLastUpdated,
+            })
+          : Promise.resolve(null),
+        document
+          ? presentDocument(ctx, document, {
+              isPublic: cannot(user, "read", document),
+              shareId: share.id,
+              includeUpdatedAt: share.showLastUpdated,
+            })
+          : Promise.resolve(null),
+      ]);
+      const serializedTeam = presentPublicTeam(
+        team,
+        !!team.getPreference(TeamPreference.PublicBranding)
+      );
 
       ctx.body = {
         data: {
-          shares: [presentShare(share, user?.isAdmin ?? false)],
+          shares: [
+            presentShare(share, {
+              isAdmin: user?.isAdmin ?? false,
+              isPublic: cannot(user, "read", share),
+            }),
+          ],
           sharedTree,
           team: serializedTeam,
           collection: serializedCollection,
@@ -118,12 +139,14 @@ router.post(
 
       ctx.body = {
         data: {
-          shares: shares.map((s) => presentShare(s, user.isAdmin ?? false)),
+          shares: shares.map((s) =>
+            presentShare(s, { isAdmin: user.isAdmin ?? false })
+          ),
         },
         policies: presentPolicies(user, shares),
       };
     } catch (err) {
-      if (err.id === "not_found") {
+      if (errToId(err) === "not_found") {
         ctx.response.status = 204;
         return;
       }
@@ -154,9 +177,11 @@ router.post(
     };
 
     if (query) {
-      collectionWhere["$collection.name$"] = { [Op.iLike]: `%${query}%` };
+      collectionWhere["$collection.name$"] = {
+        [Op.iLike]: QueryHelper.likeContains(query),
+      };
       documentWhere["$document.title$"] = {
-        [Op.iLike]: `%${query}%`,
+        [Op.iLike]: QueryHelper.likeContains(query),
       };
     }
 
@@ -202,7 +227,7 @@ router.post(
         },
         {
           model: User,
-          required: true,
+          required: false,
           as: "user",
         },
         {
@@ -226,7 +251,9 @@ router.post(
 
     ctx.body = {
       pagination: { ...ctx.state.pagination, total },
-      data: shares.map((share) => presentShare(share, user.isAdmin)),
+      data: shares.map((share) =>
+        presentShare(share, { isAdmin: user.isAdmin })
+      ),
       policies: presentPolicies(user, shares),
     };
   }
@@ -234,6 +261,7 @@ router.post(
 
 router.post(
   "shares.create",
+  rateLimiter(RateLimiterStrategy.TwentyFivePerMinute),
   auth(),
   validate(T.SharesCreateSchema),
   transaction(),
@@ -245,6 +273,7 @@ router.post(
       urlId,
       includeChildDocuments,
       allowIndexing,
+      allowSubscriptions,
       showLastUpdated,
       showTOC,
     } = ctx.input.body;
@@ -262,12 +291,18 @@ router.post(
         })
       : null;
 
-    // user could be creating the share link to share with team members
-    authorize(user, "read", collectionId ? collection : document);
+    if (documentId && !document) {
+      throw NotFoundError();
+    }
+    if (collectionId && !collection) {
+      throw NotFoundError();
+    }
 
-    if (published) {
-      authorize(user, "share", user.team);
-      authorize(user, "share", collectionId ? collection : document);
+    if (document) {
+      authorize(user, "read", document);
+    }
+    if (collection) {
+      authorize(user, "read", collection);
     }
 
     const [share] = await Share.findOrCreateWithCtx(ctx, {
@@ -280,13 +315,24 @@ router.post(
       defaults: {
         userId: user.id,
         published,
-        includeChildDocuments,
+        includeChildDocuments: published || includeChildDocuments,
         allowIndexing,
+        allowSubscriptions,
         showLastUpdated,
         showTOC,
         urlId,
       },
     });
+
+    if (share.published) {
+      authorize(user, "share", user.team);
+      if (document) {
+        authorize(user, "share", document);
+      }
+      if (collection) {
+        authorize(user, "share", collection);
+      }
+    }
 
     share.team = user.team;
     share.user = user;
@@ -312,8 +358,11 @@ router.post(
       published,
       urlId,
       allowIndexing,
+      allowSubscriptions,
       showLastUpdated,
       showTOC,
+      title,
+      iconUrl,
     } = ctx.input.body;
 
     const { user } = ctx.state.auth;
@@ -326,35 +375,27 @@ router.post(
 
     authorize(user, "update", share);
 
-    if (published !== undefined) {
-      share.published = published;
-      if (published) {
-        share.includeChildDocuments = true;
-      }
+    // Publishing a share includes child documents unless specified otherwise.
+    if (published) {
+      share.includeChildDocuments = true;
     }
 
-    if (includeChildDocuments !== undefined) {
-      share.includeChildDocuments = includeChildDocuments;
-    }
-
-    if (!isUndefined(urlId)) {
-      share.urlId = urlId;
-    }
-
-    if (allowIndexing !== undefined) {
-      share.allowIndexing = allowIndexing;
-    }
-    if (showLastUpdated !== undefined) {
-      share.showLastUpdated = showLastUpdated;
-    }
-    if (showTOC !== undefined) {
-      share.showTOC = showTOC;
-    }
+    share.fill({
+      published,
+      includeChildDocuments,
+      urlId,
+      allowIndexing,
+      allowSubscriptions,
+      showLastUpdated,
+      showTOC,
+      title: title === "" ? null : title,
+      iconUrl: iconUrl === "" ? null : iconUrl,
+    });
 
     await share.saveWithCtx(ctx);
 
     ctx.body = {
-      data: presentShare(share, user.isAdmin),
+      data: presentShare(share, { isAdmin: user.isAdmin }),
       policies: presentPolicies(user, [share]),
     };
   }
@@ -368,7 +409,9 @@ router.post(
   async (ctx: APIContext<T.SharesRevokeReq>) => {
     const { id } = ctx.input.body;
     const { user } = ctx.state.auth;
-    const share = await Share.findByPk(id);
+    const share = await Share.scope({
+      method: ["withCollectionPermissions", user.id],
+    }).findByPk(id);
 
     if (!share?.collection && !share?.document) {
       throw NotFoundError();
@@ -391,7 +434,7 @@ router.get(
   validate(T.SharesSitemapSchema),
   async (ctx: APIContext<T.SharesSitemapReq>) => {
     const { id } = ctx.input.query;
-    const team = await getTeamFromContext(ctx, { includeStateCookie: false });
+    const team = await getTeamFromContext(ctx, { includeOAuthState: false });
 
     const { share, sharedTree } = await loadPublicShare({
       id,
@@ -409,6 +452,231 @@ router.get(
 
     ctx.set("Content-Type", "application/xml");
     ctx.body = navigationNodeToSitemap(sharedTree, baseUrl);
+  }
+);
+
+router.post(
+  "shares.subscribe",
+  rateLimiter(RateLimiterStrategy.TenPerHour),
+  validate(T.SharesSubscribeSchema),
+  transaction(),
+  async (ctx: APIContext<T.SharesSubscribeReq>) => {
+    if (!env.EMAIL_ENABLED) {
+      throw InvalidRequestError("Email is not configured");
+    }
+
+    const { shareId, documentId, email } = ctx.input.body;
+    const { transaction } = ctx.state;
+    const team = await getTeamFromContext(ctx, { includeOAuthState: false });
+
+    // Validate the share exists and is published
+    const { share, document } = await loadPublicShare({
+      id: shareId,
+      documentId,
+      teamId: team?.id,
+    });
+
+    if (!share.allowSubscriptions) {
+      throw InvalidRequestError("Subscriptions are not enabled for this share");
+    }
+
+    const emailFingerprint = ShareSubscription.normalizeEmailFingerprint(email);
+
+    const existing = await ShareSubscription.findOne({
+      where: { shareId: share.id, documentId, emailFingerprint },
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+
+    let subscription: ShareSubscription;
+
+    if (existing) {
+      // Already confirmed and active — return success silently
+      if (existing.isConfirmed && !existing.isUnsubscribed) {
+        ctx.body = { success: true };
+        return;
+      }
+
+      // Unsubscribed — allow re-subscribe with new confirmation
+      if (existing.isUnsubscribed) {
+        existing.unsubscribedAt = null;
+        existing.confirmedAt = null;
+        existing.lastNotifiedAt = null;
+        existing.secret = randomString(32);
+        existing.email = email;
+        await existing.save({ transaction });
+      } else if (!existing.canResendConfirmation) {
+        // Confirmation was sent recently, not yet confirmed — don't spam
+        ctx.body = { success: true };
+        return;
+      } else {
+        // Expired or stale unconfirmed — regenerate
+        existing.secret = randomString(32);
+        existing.email = email;
+        await existing.save({ transaction });
+      }
+
+      subscription = existing;
+    } else {
+      subscription = await ShareSubscription.create(
+        {
+          shareId: share.id,
+          documentId,
+          email,
+          emailFingerprint,
+          secret: randomString(32),
+          ipAddress: ctx.request.ip,
+        },
+        { transaction }
+      );
+    }
+
+    const confirmUrl = ShareSubscriptionHelper.confirmUrl(subscription);
+    const usePublicBranding =
+      share.team?.getPreference(TeamPreference.PublicBranding) ?? false;
+    await new ShareSubscriptionConfirmEmail({
+      to: email,
+      documentTitle: document?.displayTitle ?? "",
+      confirmUrl,
+      teamName: usePublicBranding ? share.team?.name : undefined,
+    }).schedule();
+
+    ctx.body = { success: true };
+  }
+);
+
+router.get(
+  "shares.confirmSubscription",
+  rateLimiter(RateLimiterStrategy.TenPerMinute),
+  validate(T.SharesConfirmSubscriptionSchema),
+  transaction(),
+  async (ctx: APIContext<T.SharesConfirmSubscriptionReq>) => {
+    const { id, token, follow } = ctx.input.query;
+    const { transaction } = ctx.state;
+
+    // Anti-prefetch: prevent email clients from pre-fetching the link
+    if (!follow) {
+      return ctx.redirectOnClient(ctx.request.href + "&follow=true");
+    }
+
+    const subscription = await ShareSubscription.findByPk(id, {
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+
+    if (!subscription || subscription.isUnsubscribed) {
+      ctx.redirect(`${env.URL}?notice=invalid-auth`);
+      return;
+    }
+
+    const share = await Share.findByPk(subscription.shareId);
+
+    if (!share?.allowSubscriptions) {
+      ctx.redirect(`${env.URL}?notice=invalid-auth`);
+      return;
+    }
+
+    const expectedToken = ShareSubscription.generateConfirmToken(subscription);
+
+    if (!safeEqual(token, expectedToken)) {
+      ctx.redirect(`${env.URL}?notice=invalid-auth`);
+      return;
+    }
+
+    if (subscription.isTokenExpired && !subscription.isConfirmed) {
+      ctx.redirect(`${env.URL}?notice=expired-token`);
+      return;
+    }
+
+    subscription.confirmedAt = new Date();
+    await subscription.save({ transaction });
+
+    let redirectUrl = share?.canonicalUrl ?? env.URL;
+
+    if (
+      subscription.documentId &&
+      subscription.documentId !== share.documentId
+    ) {
+      const doc = await Document.findByPk(subscription.documentId);
+      if (doc?.path) {
+        redirectUrl = `${redirectUrl.replace(/\/$/, "")}${doc.path}`;
+      }
+    }
+
+    ctx.redirect(`${redirectUrl}?notice=${QueryNotices.Subscribed}`);
+  }
+);
+
+/**
+ * Marks the share subscription in the request as unsubscribed, if the token is
+ * valid.
+ *
+ * @param ctx The request context.
+ * @returns The updated subscription, or undefined if the token is not valid.
+ */
+const unsubscribeShare = async (ctx: APIContext<T.SharesUnsubscribeReq>) => {
+  const { id, token } = ctx.input.query;
+  const { transaction } = ctx.state;
+
+  const subscription = await ShareSubscription.findByPk(id, {
+    transaction,
+    lock: transaction.LOCK.UPDATE,
+  });
+
+  if (!subscription) {
+    return;
+  }
+
+  const expectedToken =
+    ShareSubscription.generateUnsubscribeToken(subscription);
+
+  if (!safeEqual(token, expectedToken)) {
+    return;
+  }
+
+  subscription.unsubscribedAt = new Date();
+  await subscription.save({ transaction });
+  return subscription;
+};
+
+router.get(
+  "shares.unsubscribe",
+  validate(T.SharesUnsubscribeSchema),
+  transaction(),
+  async (ctx: APIContext<T.SharesUnsubscribeReq>) => {
+    const { follow } = ctx.input.query;
+
+    // Anti-prefetch: prevent email clients from pre-fetching the link
+    if (!follow) {
+      return ctx.redirectOnClient(ctx.request.href + "&follow=true");
+    }
+
+    const subscription = await unsubscribeShare(ctx);
+    if (!subscription) {
+      ctx.redirect(`${env.URL}?notice=invalid-auth`);
+      return;
+    }
+
+    const share = await Share.findByPk(subscription.shareId);
+    const shareUrl = share?.canonicalUrl ?? env.URL;
+    ctx.redirect(`${shareUrl}?notice=${QueryNotices.Unsubscribed}`);
+  }
+);
+
+// Supports RFC 8058 one-click unsubscribe from the List-Unsubscribe header.
+router.post(
+  "shares.unsubscribe",
+  validate(T.SharesUnsubscribeSchema),
+  transaction(),
+  async (ctx: APIContext<T.SharesUnsubscribeReq>) => {
+    const subscription = await unsubscribeShare(ctx);
+    if (!subscription) {
+      throw AuthenticationError("Invalid unsubscribe token");
+    }
+
+    ctx.body = {
+      success: true,
+    };
   }
 );
 

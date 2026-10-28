@@ -1,16 +1,24 @@
-import Router from "koa-router";
+import Router from "@koa/router";
+import { toError } from "@shared/utils/error";
 import { IntegrationService, IntegrationType } from "@shared/types";
+import { ValidationError } from "@server/errors";
 import Logger from "@server/logging/Logger";
 import apexAuthRedirect from "@server/middlewares/apexAuthRedirect";
 import auth from "@server/middlewares/authentication";
 import { transaction } from "@server/middlewares/transaction";
 import validate from "@server/middlewares/validate";
 import { IntegrationAuthentication, Integration } from "@server/models";
+import { authorize } from "@server/policies";
+import { afterCommit } from "@server/storage/transaction";
 import type { APIContext } from "@server/types";
+import { verifyOAuthStateNonce } from "@server/utils/oauth";
 import { Linear } from "../linear";
 import UploadIntegrationLogoTask from "@server/queues/tasks/UploadIntegrationLogoTask";
 import * as T from "./schema";
-import { LinearUtils } from "plugins/linear/shared/LinearUtils";
+import {
+  LinearOAuthNonceCookie,
+  LinearUtils,
+} from "plugins/linear/shared/LinearUtils";
 import { addSeconds } from "date-fns";
 
 const router = new Router();
@@ -32,7 +40,7 @@ router.get(
   }),
   transaction(),
   async (ctx: APIContext<T.LinearCallbackReq>) => {
-    const { code, error } = ctx.input.query;
+    const { code, error, state } = ctx.input.query;
     const { user } = ctx.state.auth;
     const { transaction } = ctx.state;
 
@@ -41,6 +49,14 @@ router.get(
       ctx.redirect(LinearUtils.errorUrl(error));
       return;
     }
+
+    const parsedState = LinearUtils.parseState(state);
+    if (!parsedState) {
+      throw ValidationError("Invalid state");
+    }
+
+    verifyOAuthStateNonce(ctx, LinearOAuthNonceCookie, parsedState.nonce);
+    authorize(user, "createIntegration", user.team);
 
     try {
       // validation middleware ensures that code is non-null at this point.
@@ -76,7 +92,7 @@ router.get(
                 id: workspace.id,
                 name: workspace.name,
                 key: workspace.urlKey,
-                logoUrl: workspace.logoUrl,
+                logoUrl: workspace.logoUrl ?? undefined,
               },
             },
           },
@@ -84,7 +100,7 @@ router.get(
         { transaction }
       );
 
-      transaction.afterCommit(async () => {
+      await afterCommit(transaction, async () => {
         if (workspace.logoUrl) {
           await new UploadIntegrationLogoTask().schedule({
             integrationId: integration.id,
@@ -95,7 +111,10 @@ router.get(
 
       ctx.redirect(LinearUtils.successUrl());
     } catch (err) {
-      Logger.error("Encountered error during Linear OAuth callback", err);
+      Logger.error(
+        "Encountered error during Linear OAuth callback",
+        toError(err)
+      );
       ctx.redirect(LinearUtils.errorUrl("unknown"));
     }
   }

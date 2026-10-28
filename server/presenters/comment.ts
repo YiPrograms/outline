@@ -15,11 +15,8 @@ export default function present(
   let anchorText: string | undefined;
 
   if (includeAnchorText && comment.document) {
-    const commentMarks = ProsemirrorHelper.getComments(
-      DocumentHelper.toProsemirror(comment.document)
-    );
     anchorText = ProsemirrorHelper.getAnchorTextForComment(
-      commentMarks,
+      DocumentHelper.getCommentMarks(comment.document),
       comment.id
     );
   }

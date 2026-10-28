@@ -1,7 +1,7 @@
 import { observer } from "mobx-react";
 import React from "react";
 import { useTranslation } from "react-i18next";
-import { useHistory, useLocation } from "react-router-dom";
+import { useHistory } from "react-router-dom";
 import { toast } from "sonner";
 import env from "@shared/env";
 import { IntegrationService } from "@shared/types";
@@ -9,8 +9,9 @@ import Button from "~/components/Button";
 import useCurrentTeam from "~/hooks/useCurrentTeam";
 import useQuery from "~/hooks/useQuery";
 import useStores from "~/hooks/useStores";
+import { generateOAuthStateNonce } from "~/utils/oauth";
 import { redirectTo } from "~/utils/urls";
-import { NotionUtils } from "../shared/NotionUtils";
+import { NotionOAuthNonceCookie, NotionUtils } from "../shared/NotionUtils";
 import { ImportDialog } from "./components/ImportDialog";
 
 export const Notion = observer(() => {
@@ -18,11 +19,9 @@ export const Notion = observer(() => {
   const { dialogs } = useStores();
   const team = useCurrentTeam();
   const history = useHistory();
-  const location = useLocation();
   const queryParams = useQuery();
 
   const appName = env.APP_NAME;
-  const authUrl = NotionUtils.authUrl({ state: { teamId: team.id } });
 
   const service = queryParams.get("service");
   const oauthSuccess = queryParams.get("success") === "";
@@ -31,10 +30,10 @@ export const Notion = observer(() => {
 
   const clearQueryParams = React.useCallback(() => {
     history.replace({
-      pathname: location.pathname,
+      pathname: history.location.pathname,
       search: "",
     });
-  }, [history, location]);
+  }, [history]);
 
   const handleSubmit = React.useCallback(() => {
     dialogs.closeAllModals();
@@ -55,7 +54,15 @@ export const Notion = observer(() => {
         onClose: clearQueryParams,
       });
     }
-  }, [t, dialogs, oauthSuccess, service, clearQueryParams]);
+  }, [
+    t,
+    dialogs,
+    oauthSuccess,
+    service,
+    clearQueryParams,
+    handleSubmit,
+    integrationId,
+  ]);
 
   React.useEffect(() => {
     if (!oauthError) {
@@ -80,10 +87,15 @@ export const Notion = observer(() => {
     }
   }, [t, appName, oauthError]);
 
+  const handleConnect = React.useCallback(() => {
+    const nonce = generateOAuthStateNonce(NotionOAuthNonceCookie);
+    redirectTo(NotionUtils.authUrl({ state: { teamId: team.id, nonce } }));
+  }, [team.id]);
+
   return (
     <Button
       type="submit"
-      onClick={() => redirectTo(authUrl)}
+      onClick={handleConnect}
       disabled={!env.NOTION_CLIENT_ID}
       neutral
     >

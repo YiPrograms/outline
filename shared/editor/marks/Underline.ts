@@ -1,5 +1,5 @@
-import { toggleMark } from "prosemirror-commands";
 import type { MarkSpec, MarkType } from "prosemirror-model";
+import { toggleMark } from "../commands/toggleMark";
 import { markInputRuleForPattern } from "../lib/markInputRule";
 import underlinesRule from "../rules/underlines";
 import Mark from "./Mark";
@@ -16,9 +16,11 @@ export default class Underline extends Mark {
         {
           consuming: false,
           tag: ":not(a)",
+          // Elements outside the HTML and SVG namespaces, such as MathML, may
+          // have no style property.
           getAttrs: (node: HTMLElement) =>
-            node.style.textDecoration.includes("underline") ||
-            node.style.textDecorationLine.includes("underline")
+            node.style?.textDecoration.includes("underline") ||
+            node.style?.textDecorationLine.includes("underline")
               ? null
               : false,
         },

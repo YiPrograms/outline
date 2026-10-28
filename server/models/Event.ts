@@ -18,18 +18,18 @@ import {
   Length,
 } from "sequelize-typescript";
 import { globalEventQueue } from "../queues";
+import { afterCommit } from "../storage/transaction";
 import type { APIContext } from "../types";
 import { AuthenticationType } from "../types";
+import { normalizeIp } from "../utils/ip";
 import Collection from "./Collection";
 import Document from "./Document";
 import Team from "./Team";
 import User from "./User";
 import IdModel from "./base/IdModel";
-import Fix from "./decorators/Fix";
 import type { Context } from "koa";
 
 @Table({ tableName: "events", modelName: "event", updatedAt: false })
-@Fix
 class Event extends IdModel<
   InferAttributes<Event>,
   Partial<InferCreationAttributes<Event>>
@@ -48,7 +48,7 @@ class Event extends IdModel<
 
   /** The originating IP address of the event. */
   @IsIP
-  @Column
+  @Column(DataType.STRING)
   ip: string | null;
 
   /** The type of authentication used to create the event. */
@@ -60,6 +60,7 @@ class Event extends IdModel<
    * Note that the `data` column will be visible to the client and API requests.
    */
   @Column(DataType.JSONB)
+  // oxlint-disable-next-line @typescript-eslint/no-explicit-any
   data: Record<string, any> | null;
 
   /**
@@ -67,16 +68,14 @@ class Event extends IdModel<
    * used for arbitrary data associated with the event.
    */
   @Column(DataType.JSONB)
+  // oxlint-disable-next-line @typescript-eslint/no-explicit-any
   changes: Record<string, any> | null;
 
   // hooks
 
   @BeforeCreate
   static cleanupIp(model: Event) {
-    if (model.ip) {
-      // cleanup IPV6 representations of IPV4 addresses
-      model.ip = model.ip.replace(/^::ffff:/, "");
-    }
+    model.ip = normalizeIp(model.ip);
   }
 
   @AfterSave
@@ -84,16 +83,10 @@ class Event extends IdModel<
     model: Event,
     options: SaveOptions<InferAttributes<Event>>
   ) {
-    if (options.transaction) {
-      // 'findOrCreate' creates a new transaction always, and the transaction from the middleware is set as its parent.
-      // We want to use the parent transaction, otherwise the 'afterCommit' hook will never fire in this case.
-      // See: https://github.com/sequelize/sequelize/issues/17452
-      (options.transaction.parent || options.transaction).afterCommit(
-        () => void globalEventQueue().add(model)
-      );
-      return;
-    }
-    void globalEventQueue().add(model);
+    await afterCommit(
+      options.transaction,
+      () => void globalEventQueue().add(model)
+    );
   }
 
   // associations

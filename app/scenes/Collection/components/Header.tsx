@@ -1,17 +1,18 @@
 import { IconTitleWrapper } from "@shared/components/Icon";
-import breakpoint from "styled-components-breakpoint";
-import first from "lodash/first";
+import { breakpoint } from "@shared/styles/breakpoint";
+import { first } from "es-toolkit/compat";
 import { Suspense, useCallback } from "react";
 import styled from "styled-components";
 import { CollectionValidation } from "@shared/validations";
+import { isRTL } from "@shared/utils/rtl";
 import Heading from "~/components/Heading";
 import ContentEditable from "~/components/ContentEditable";
 import CollectionIcon from "~/components/Icons/CollectionIcon";
 import type Collection from "~/models/Collection";
-import { colorPalette } from "@shared/utils/collections";
+import { colorPalette } from "@shared/constants";
 import usePolicy from "~/hooks/usePolicy";
 import { observer } from "mobx-react";
-import lazyWithRetry from "~/utils/lazyWithRetry";
+import lazyWithRetry from "@shared/utils/lazyWithRetry";
 
 const IconPicker = lazyWithRetry(() => import("~/components/IconPicker"));
 
@@ -48,9 +49,11 @@ export const Header = observer(function Header_({
     <CollectionIcon collection={collection} size={40} expanded />
   ) : null;
 
+  const dir = isRTL(collection.displayName) ? "rtl" : "ltr";
+
   return (
-    <StyledHeading>
-      <IconTitleWrapper>
+    <StyledHeading dir={dir}>
+      <IconTitleWrapper dir={dir}>
         {canEdit ? (
           <Suspense fallback={fallbackIcon}>
             <IconPicker
@@ -77,7 +80,7 @@ export const Header = observer(function Header_({
           dir="auto"
         />
       ) : (
-        collection.name
+        collection.displayName
       )}
     </StyledHeading>
   );
@@ -87,7 +90,7 @@ const StyledHeading = styled(Heading)`
   display: flex;
   align-items: center;
   position: relative;
-  margin-left: 40px;
+  margin-left: 16px;
 
   ${breakpoint("tablet")`
     margin-left: 0;

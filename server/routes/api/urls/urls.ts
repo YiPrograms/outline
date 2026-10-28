@@ -1,17 +1,23 @@
 import dns from "node:dns";
-import Router from "koa-router";
+import Router from "@koa/router";
 import { traceFunction } from "@server/logging/tracing";
+import isUUID from "validator/lib/isUUID";
 import { MentionType, UnfurlResourceType } from "@shared/types";
-import { getBaseDomain, parseDomain } from "@shared/utils/domains";
+import { parseDomain } from "@shared/utils/domains";
 import parseDocumentSlug from "@shared/utils/parseDocumentSlug";
 import parseMentionUrl from "@shared/utils/parseMentionUrl";
-import { isInternalUrl } from "@shared/utils/urls";
-import { NotFoundError, ValidationError } from "@server/errors";
+import { isInternalUrl, parseShareIdFromUrl } from "@shared/utils/urls";
+import {
+  AuthenticationError,
+  NotFoundError,
+  ValidationError,
+} from "@server/errors";
 import auth from "@server/middlewares/authentication";
 import { rateLimiter } from "@server/middlewares/rateLimiter";
 import validate from "@server/middlewares/validate";
 import { Document, Share, Team, User, Group, GroupUser } from "@server/models";
 import { authorize, can } from "@server/policies";
+import { loadPublicShare } from "@server/commands/shareLoader";
 import presentUnfurl from "@server/presenters/unfurl";
 import type { APIContext, Unfurl } from "@server/types";
 import { CacheHelper, type CacheResult } from "@server/utils/CacheHelper";
@@ -22,9 +28,10 @@ import {
   checkEmbeddability,
   type EmbedCheckResult,
 } from "@server/utils/embeds";
+import { getTeamFromContext } from "@server/utils/passport";
 import * as T from "./schema";
 import { MAX_AVATAR_DISPLAY } from "@shared/constants";
-import { Day } from "@shared/utils/time";
+import { Day, Minute } from "@shared/utils/time";
 
 const router = new Router();
 const plugins = PluginManager.getHooks(Hook.UnfurlProvider);
@@ -32,12 +39,57 @@ const plugins = PluginManager.getHooks(Hook.UnfurlProvider);
 router.post(
   "urls.unfurl",
   rateLimiter(RateLimiterStrategy.OneThousandPerHour),
-  auth(),
+  auth({ optional: true }),
   validate(T.UrlsUnfurlSchema),
   async (ctx: APIContext<T.UrlsUnfurlReq>) => {
     const { url, documentId } = ctx.input.body;
-    const { user: actor } = ctx.state.auth;
     const urlObj = new URL(url);
+
+    // A url may point at this installation without matching the default env.URL
+    // when the team is on a custom domain or hosted subdomain.
+    const isTeamUrl =
+      isInternalUrl(url) || !!ctx.state.auth.user?.team.isTeamUrl(url);
+
+    // Public share URLs – does not require authentication
+    if (isTeamUrl) {
+      const shareId = parseShareIdFromUrl(url);
+
+      if (shareId) {
+        const actor = ctx.state.auth.user;
+        // teamId is only passed for slugs, so shares of other teams can unfurl
+        let teamId: string | undefined;
+        if (!isUUID(shareId)) {
+          teamId =
+            actor?.teamId ??
+            (await getTeamFromContext(ctx, { includeOAuthState: false }))?.id;
+        }
+        const previewDocumentId = parseDocumentSlug(url);
+        const { share, document } = await loadPublicShare({
+          id: shareId,
+          documentId: previewDocumentId,
+          teamId,
+        });
+
+        if (!document) {
+          ctx.response.status = 204;
+          return;
+        }
+
+        ctx.body = await presentUnfurl({
+          type: UnfurlResourceType.Document,
+          document,
+          anchor: urlObj.hash,
+          url: `${share.canonicalUrl}/doc/${document.url.replace("/doc/", "")}${urlObj.hash}`,
+        });
+        return;
+      }
+    }
+
+    // Everything below requires authentication
+    const { user: actor } = ctx.state.auth;
+    if (!actor) {
+      throw AuthenticationError();
+    }
 
     // Mentions
     if (urlObj.protocol === "mention:") {
@@ -68,7 +120,11 @@ router.post(
             user,
             document,
           },
-          { includeEmail: !!can(actor, "readEmail", user) }
+          {
+            includeEmail: !!can(actor, "readEmail", user),
+            includeLastViewed:
+              document.insightsEnabled && !!can(actor, "listViews", document),
+          }
         );
       } else if (mentionType === MentionType.Group) {
         const [group, document] = await Promise.all([
@@ -110,24 +166,26 @@ router.post(
     }
 
     // Internal resources
-    if (isInternalUrl(url) || parseDomain(url).host === actor.team.domain) {
+    if (isTeamUrl) {
       const previewDocumentId = parseDocumentSlug(url);
       if (previewDocumentId) {
-        const document = previewDocumentId
-          ? await Document.findByPk(previewDocumentId, { userId: actor.id })
-          : undefined;
-        if (!document) {
-          throw NotFoundError("Document does not exist");
+        const document = await Document.findByPk(previewDocumentId, {
+          userId: actor.id,
+        });
+        if (!document || !can(actor, "read", document)) {
+          ctx.response.status = 204;
+          return;
         }
-        authorize(actor, "read", document);
 
         ctx.body = await presentUnfurl({
           type: UnfurlResourceType.Document,
           document,
           viewer: actor,
+          anchor: urlObj.hash,
         });
         return;
       }
+
       ctx.response.status = 204;
       return;
     }
@@ -135,7 +193,11 @@ router.post(
     // External resources
     // Use getDataOrSet which handles distributed locking to prevent thundering herd
     // when multiple clients request the same URL simultaneously
-    const cacheKey = RedisPrefixHelper.getUnfurlKey(actor.teamId, url);
+    const cacheKey = RedisPrefixHelper.getUnfurlKey(
+      actor.teamId,
+      actor.id,
+      url
+    );
     const defaultCacheExpiry = 3600;
 
     const unfurlResult = await CacheHelper.getDataOrSet<
@@ -155,7 +217,14 @@ router.post(
           })(() => plugin.value.unfurl(url, actor))();
           if (unfurl) {
             if ("error" in unfurl) {
-              return { data: { error: true as const }, expiry: 60 };
+              return {
+                data: { error: true as const },
+                expiry:
+                  "cacheExpiry" in unfurl &&
+                  typeof unfurl.cacheExpiry === "number"
+                    ? unfurl.cacheExpiry
+                    : Minute.seconds,
+              };
             }
             return {
               data: unfurl as Unfurl,
@@ -207,11 +276,7 @@ router.post(
     const { hostname } = ctx.input.body;
 
     const [team, share] = await Promise.all([
-      Team.findOne({
-        where: {
-          domain: hostname,
-        },
-      }),
+      Team.findByDomain(hostname),
       Share.findOne({
         where: {
           domain: hostname,
@@ -233,21 +298,20 @@ router.post(
         });
       });
     } catch (err) {
-      if (err.code === "ENOTFOUND") {
+      if (err instanceof Error && "code" in err && err.code === "ENOTFOUND") {
         throw NotFoundError("No CNAME record found");
       }
 
       throw ValidationError("Invalid domain");
     }
 
-    if (addresses.length === 0) {
+    const address = addresses[0];
+    if (!address) {
       throw ValidationError("No CNAME record found");
     }
 
-    const address = addresses[0];
-    const likelyValid = address.endsWith(getBaseDomain());
-
-    if (!likelyValid) {
+    // the record must point at the base domain, or a subdomain of it
+    if (parseDomain(address).custom) {
       throw ValidationError("CNAME is not configured correctly");
     }
 

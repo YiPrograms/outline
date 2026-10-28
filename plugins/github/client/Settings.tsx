@@ -18,12 +18,17 @@ import Time from "~/components/Time";
 import env from "~/env";
 import useQuery from "~/hooks/useQuery";
 import useStores from "~/hooks/useStores";
+import isCloudHosted from "~/utils/isCloudHosted";
+import { isTruthyQueryValue } from "~/utils/urls";
 import GitHubIcon from "./Icon";
 import { GitHubConnectButton } from "./components/GitHubButton";
 
 function GitHub() {
   const { integrations } = useStores();
   const { t } = useTranslation();
+  const githubIntegrations = integrations.filterByService(
+    IntegrationService.GitHub
+  );
   const query = useQuery();
   const error = query.get("error");
   const installRequest = query.get("install_request");
@@ -31,7 +36,7 @@ function GitHub() {
   const githubAppName = env.GITHUB_APP_NAME;
 
   React.useEffect(() => {
-    void integrations.fetchAll({
+    void integrations.fetchAllIfNeeded({
       service: IntegrationService.GitHub,
       withRelations: true,
     });
@@ -57,10 +62,35 @@ function GitHub() {
           </Trans>
         </Notice>
       )}
-      {installRequest === "true" && (
+      {error === "denied" && (
         <Notice>
           <Trans>
-            The owner of GitHub account has been requested to install the{" "}
+            Only an owner of the GitHub account or organization can connect it
+            to {{ appName }}.
+          </Trans>
+        </Notice>
+      )}
+      {error === "missing_permission" && (
+        <Notice>
+          {isCloudHosted ? (
+            <Trans>
+              The GitHub app needs new permissions for the organization. Ask an
+              owner of the organization to accept them in GitHub, then try
+              again.
+            </Trans>
+          ) : (
+            <Trans>
+              The GitHub app needs the “Members” read permission for the
+              organization. Add this permission to your GitHub app, then ask an
+              owner of the organization to accept it in GitHub and try again.
+            </Trans>
+          )}
+        </Notice>
+      )}
+      {isTruthyQueryValue(installRequest) && (
+        <Notice>
+          <Trans>
+            The owner of the GitHub account has been requested to install the{" "}
             {{ githubAppName }} GitHub app. Once approved, previews will be
             shown for respective links.
           </Trans>
@@ -72,11 +102,11 @@ function GitHub() {
             <Trans>
               Enable previews of GitHub issues and pull requests in documents by
               connecting a GitHub organization or specific repositories to{" "}
-              {appName}.
+              {{ appName }}.
             </Trans>
           </Text>
 
-          {integrations.github.length ? (
+          {githubIntegrations.length ? (
             <>
               <Heading as="h2">
                 <Flex justify="space-between" auto>
@@ -85,7 +115,7 @@ function GitHub() {
                 </Flex>
               </Heading>
               <List>
-                {integrations.github.map((integration) => {
+                {githubIntegrations.map((integration) => {
                   const githubAccount =
                     integration.settings?.github?.installation.account;
                   const integrationCreatedBy = integration.user

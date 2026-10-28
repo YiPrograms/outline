@@ -1,4 +1,4 @@
-import compact from "lodash/compact";
+import { compact } from "es-toolkit/compat";
 import { observer } from "mobx-react";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
@@ -19,7 +19,7 @@ const UserStatusFilter = ({ activeKey, onSelect, ...rest }: Props) => {
       compact([
         {
           key: "all",
-          label: t("All status"),
+          label: t("Any status"),
         },
         {
           key: "",

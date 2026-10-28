@@ -1,17 +1,21 @@
-import { decodeURIComponentSafe, isAllowedLoginRedirect } from "./urls";
+import {
+  decodeURIComponentSafe,
+  isAllowedLoginRedirect,
+  isTruthyQueryValue,
+} from "./urls";
 
 describe("decodeURIComponentSafe", () => {
-  test("to handle % symbols", () => {
+  it("to handle % symbols", () => {
     expect(decodeURIComponentSafe("%")).toBe("%");
     expect(decodeURIComponentSafe("%25")).toBe("%");
   });
 
-  test("to correctly account for encoded symbols", () => {
+  it("to correctly account for encoded symbols", () => {
     expect(decodeURIComponentSafe("%7D")).toBe("}");
     expect(decodeURIComponentSafe("%2F")).toBe("/");
   });
 
-  test("to handle malformed percent encoding", () => {
+  it("to handle malformed percent encoding", () => {
     // Single % at end of string
     expect(decodeURIComponentSafe("test%")).toBe("test%");
 
@@ -30,7 +34,7 @@ describe("decodeURIComponentSafe", () => {
     expect(decodeURIComponentSafe("%A%B")).toBe("%A%B");
   });
 
-  test("to handle mixed valid and invalid percent encoding", () => {
+  it("to handle mixed valid and invalid percent encoding", () => {
     // Valid encoding mixed with invalid
     expect(decodeURIComponentSafe("%20test%")).toBe(" test%");
     expect(decodeURIComponentSafe("%7D%invalid")).toBe("}%invalid");
@@ -40,7 +44,7 @@ describe("decodeURIComponentSafe", () => {
     expect(decodeURIComponentSafe("%20%A%2F%")).toBe(" %A/%");
   });
 
-  test("to handle edge cases", () => {
+  it("to handle edge cases", () => {
     // Empty string
     expect(decodeURIComponentSafe("")).toBe("");
 
@@ -62,14 +66,14 @@ describe("decodeURIComponentSafe", () => {
   });
 
   describe("isAllowedLoginRedirect", () => {
-    test("should block disallowed paths", () => {
+    it("should block disallowed paths", () => {
       expect(isAllowedLoginRedirect("/")).toBe(false);
       expect(isAllowedLoginRedirect("/create")).toBe(false);
       expect(isAllowedLoginRedirect("/home")).toBe(false);
       expect(isAllowedLoginRedirect("/logout")).toBe(false);
     });
 
-    test("should block paths starting with /auth/", () => {
+    it("should block paths starting with /auth/", () => {
       expect(isAllowedLoginRedirect("/auth/")).toBe(false);
       expect(isAllowedLoginRedirect("/auth/login")).toBe(false);
       expect(isAllowedLoginRedirect("/auth/signup")).toBe(false);
@@ -78,7 +82,7 @@ describe("decodeURIComponentSafe", () => {
       expect(isAllowedLoginRedirect("/auth/slack/callback")).toBe(false);
     });
 
-    test("should block paths starting with /s/", () => {
+    it("should block paths starting with /s/", () => {
       expect(isAllowedLoginRedirect("/s/")).toBe(false);
       expect(isAllowedLoginRedirect("/s/share")).toBe(false);
       expect(isAllowedLoginRedirect("/s/public")).toBe(false);
@@ -86,7 +90,7 @@ describe("decodeURIComponentSafe", () => {
       expect(isAllowedLoginRedirect("/s/collection/456")).toBe(false);
     });
 
-    test("should allow valid redirect paths", () => {
+    it("should allow valid redirect paths", () => {
       expect(isAllowedLoginRedirect("/documents")).toBe(true);
       expect(isAllowedLoginRedirect("/settings")).toBe(true);
       expect(isAllowedLoginRedirect("/team")).toBe(true);
@@ -95,7 +99,7 @@ describe("decodeURIComponentSafe", () => {
       expect(isAllowedLoginRedirect("/collection/456")).toBe(true);
     });
 
-    test("should strip query strings before checking", () => {
+    it("should strip query strings before checking", () => {
       expect(isAllowedLoginRedirect("/?foo=bar")).toBe(false);
       expect(isAllowedLoginRedirect("/create?id=123")).toBe(false);
       expect(isAllowedLoginRedirect("/home?tab=recent")).toBe(false);
@@ -106,7 +110,7 @@ describe("decodeURIComponentSafe", () => {
       expect(isAllowedLoginRedirect("/settings?tab=profile")).toBe(true);
     });
 
-    test("should handle edge cases", () => {
+    it("should handle edge cases", () => {
       expect(isAllowedLoginRedirect("")).toBe(true);
       expect(isAllowedLoginRedirect("/authenticate")).toBe(true); // doesn't start with /auth/
       expect(isAllowedLoginRedirect("/authorization")).toBe(true); // doesn't start with /auth/
@@ -117,11 +121,51 @@ describe("decodeURIComponentSafe", () => {
       expect(isAllowedLoginRedirect("/s")).toBe(true); // doesn't start with /s/
     });
 
-    test("should handle paths with fragments", () => {
+    it("should handle paths with fragments", () => {
       expect(isAllowedLoginRedirect("/documents#section1")).toBe(true);
       expect(isAllowedLoginRedirect("/auth/login#forgot")).toBe(false);
       expect(isAllowedLoginRedirect("/s/share#public")).toBe(false);
       expect(isAllowedLoginRedirect("/#top")).toBe(false);
     });
+
+    it("should block protocol-relative paths", () => {
+      expect(isAllowedLoginRedirect("//home")).toBe(false);
+      expect(isAllowedLoginRedirect("//evil.com")).toBe(false);
+      expect(isAllowedLoginRedirect("//evil.com/path")).toBe(false);
+      expect(isAllowedLoginRedirect("/\\evil.com")).toBe(false);
+      expect(isAllowedLoginRedirect("//documents?foo=bar")).toBe(false);
+    });
+  });
+});
+
+describe("isTruthyQueryValue", () => {
+  it("treats common affirmative values as truthy", () => {
+    expect(isTruthyQueryValue("true")).toBe(true);
+    expect(isTruthyQueryValue("1")).toBe(true);
+    expect(isTruthyQueryValue("on")).toBe(true);
+    expect(isTruthyQueryValue("yes")).toBe(true);
+  });
+
+  it("is case insensitive", () => {
+    expect(isTruthyQueryValue("TRUE")).toBe(true);
+    expect(isTruthyQueryValue("On")).toBe(true);
+    expect(isTruthyQueryValue("Yes")).toBe(true);
+  });
+
+  it("treats a bare flag with no value as truthy", () => {
+    expect(isTruthyQueryValue("")).toBe(true);
+  });
+
+  it("treats absent values as falsy", () => {
+    expect(isTruthyQueryValue(null)).toBe(false);
+    expect(isTruthyQueryValue(undefined)).toBe(false);
+  });
+
+  it("treats negative and unrecognized values as falsy", () => {
+    expect(isTruthyQueryValue("false")).toBe(false);
+    expect(isTruthyQueryValue("0")).toBe(false);
+    expect(isTruthyQueryValue("off")).toBe(false);
+    expect(isTruthyQueryValue("no")).toBe(false);
+    expect(isTruthyQueryValue("maybe")).toBe(false);
   });
 });

@@ -1,8 +1,8 @@
-import { observer } from "mobx-react";
 import type { ReactNode } from "react";
-import React, { createContext, useContext } from "react";
+import { createContext, useContext, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { useLocation } from "react-router";
+import { useHistory } from "react-router";
+import shallowEqual from "@shared/utils/shallowEqual";
 import useStores from "~/hooks/useStores";
 import type Model from "~/models/base/Model";
 import type Policy from "~/models/Policy";
@@ -12,6 +12,10 @@ import type { SidebarContextType } from "~/components/Sidebar/components/Sidebar
 export const ActionContext = createContext<ActionContextType | undefined>(
   undefined
 );
+
+const EMPTY_MODELS: Model[] = [];
+
+const EMPTY_OVERRIDES: Partial<ActionContextType> = {};
 
 interface ActionContextProviderValue {
   /** Models to add to the active models context for this subtree. */
@@ -48,112 +52,192 @@ type ActionContextProviderProps = {
  * </ActionContextProvider>
  * ```
  */
-export const ActionContextProvider = observer(function ActionContextProvider_({
+export function ActionContextProvider({
   children,
   value = {},
 }: ActionContextProviderProps) {
   const parentContext = useContext(ActionContext);
   const stores = useStores();
   const { t } = useTranslation();
-  const location = useLocation();
-  const { activeModels: valueModels, ...overrides } = value;
 
-  // Create the base context if we don't have a parent context
-  const baseContext: ActionContextType = parentContext ?? {
-    isMenu: false,
-    isCommandBar: false,
-    isButton: false,
+  // Use history (stable reference) and read location lazily via a getter so
+  // navigation does not invalidate the context value. Action perform/visible
+  // callbacks see the current location at call time via history.location,
+  // which react-router updates on every navigation.
+  const history = useHistory<{ sidebarContext?: SidebarContextType }>();
 
-    // Legacy (backward compatibility)
-    activeCollectionId: stores.ui.activeCollectionId ?? undefined,
-    activeDocumentId: stores.ui.activeDocumentId ?? undefined,
+  const { isMenu, isCommandBar, isButton, sidebarContext, event } = value;
+  const valueModels = useStableValue(value.activeModels ?? EMPTY_MODELS);
 
-    getActiveModels: <T extends Model>(
-      modelClass: new (...args: any[]) => T
-    ): T[] => stores.ui.getActiveModels<T>(modelClass),
+  // Values derived from the UI store are getters, so that the context value
+  // stays the same when the active document changes. Observers that read them
+  // still re-render, as the store is observable.
+  const contextValue = useMemo<ActionContextType>(() => {
+    const getActiveModels = <T extends Model>(
+      modelClass: new (...args: never[]) => T
+    ): T[] => {
+      const matching = valueModels.filter(
+        (model): model is T => model instanceof modelClass
+      );
+      if (matching.length > 0) {
+        return matching;
+      }
+      if (parentContext) {
+        return parentContext.getActiveModels(modelClass);
+      }
+      return stores.ui.getActiveModels<T>(modelClass);
+    };
 
-    getActiveModel: <T extends Model>(
-      modelClass: new (...args: any[]) => T
-    ): T | undefined => stores.ui.getActiveModels<T>(modelClass)[0],
+    const getActiveModel = <T extends Model>(
+      modelClass: new (...args: never[]) => T
+    ): T | undefined => getActiveModels(modelClass)[0];
 
-    getActivePolicies: <T extends Model>(
-      modelClass: new (...args: any[]) => T
+    const getActivePolicies = <T extends Model>(
+      modelClass: new (...args: never[]) => T
     ): Policy[] =>
-      stores.ui
-        .getActiveModels<T>(modelClass)
+      getActiveModels(modelClass)
         .map((node) => stores.policies.get(node.id))
-        .filter((policy): policy is Policy => policy !== undefined),
+        .filter((policy): policy is Policy => policy !== undefined);
 
-    isModelActive: (model: Model): boolean => stores.ui.isModelActive(model),
-    activeModels: new Set(stores.ui.activeModels.values()),
+    const isModelActive = (model: Model): boolean =>
+      valueModels.includes(model) ||
+      (parentContext
+        ? parentContext.isModelActive(model)
+        : stores.ui.isModelActive(model));
 
-    currentUserId: stores.auth.user?.id,
-    currentTeamId: stores.auth.team?.id,
-    location,
+    const findValueModelId = (modelName: string) =>
+      valueModels.find(
+        (m) => (m.constructor as typeof Model).modelName === modelName
+      )?.id;
+    const valueCollectionId = findValueModelId("Collection");
+    const valueDocumentId = findValueModelId("Document");
+
+    const baseContext: ActionContextType = parentContext ?? {
+      isMenu: false,
+      isCommandBar: false,
+      isButton: false,
+      get activeCollectionId() {
+        return stores.ui.activeCollectionId ?? undefined;
+      },
+      get activeDocumentId() {
+        return stores.ui.activeDocumentId ?? undefined;
+      },
+      get activeModels() {
+        return new Set(stores.ui.activeModels.values());
+      },
+      get currentUserId() {
+        return stores.auth.user?.id;
+      },
+      get currentTeamId() {
+        return stores.auth.team?.id;
+      },
+      get location() {
+        return history.location;
+      },
+      get sidebarContext() {
+        return history.location.state?.sidebarContext;
+      },
+      getActiveModels,
+      getActiveModel,
+      getActivePolicies,
+      isModelActive,
+      stores,
+      t,
+    };
+
+    return mergeLazy<ActionContextType>(baseContext, {
+      ...(isMenu !== undefined ? { isMenu } : {}),
+      ...(isCommandBar !== undefined ? { isCommandBar } : {}),
+      ...(isButton !== undefined ? { isButton } : {}),
+      ...(event !== undefined ? { event } : {}),
+
+      // Read from this provider's history, which is the pane's own history
+      // inside a split view.
+      get location() {
+        return history.location;
+      },
+      get sidebarContext() {
+        return (
+          sidebarContext ??
+          parentContext?.sidebarContext ??
+          history.location.state?.sidebarContext
+        );
+      },
+      get activeCollectionId() {
+        return valueCollectionId ?? baseContext.activeCollectionId;
+      },
+      get activeDocumentId() {
+        return valueDocumentId ?? baseContext.activeDocumentId;
+      },
+      get activeModels() {
+        const base = baseContext.activeModels;
+        return valueModels.length > 0
+          ? new Set([...base, ...valueModels])
+          : base;
+      },
+      getActiveModels,
+      getActiveModel,
+      getActivePolicies,
+      isModelActive,
+    });
+  }, [
+    parentContext,
     stores,
     t,
-  };
-
-  // Override model accessors when models are provided in value
-  const getActiveModels =
-    valueModels && valueModels.length > 0
-      ? <T extends Model>(modelClass: new (...args: any[]) => T): T[] => {
-          const matching = valueModels.filter(
-            (model): model is T => model instanceof modelClass
-          );
-          return matching.length > 0
-            ? matching
-            : baseContext.getActiveModels(modelClass);
-        }
-      : baseContext.getActiveModels;
-
-  const getActiveModel = <T extends Model>(
-    modelClass: new (...args: any[]) => T
-  ): T | undefined => getActiveModels(modelClass)[0];
-
-  const getActivePolicies = <T extends Model>(
-    modelClass: new (...args: any[]) => T
-  ): Policy[] =>
-    getActiveModels(modelClass)
-      .map((node) => stores.policies.get(node.id))
-      .filter((policy): policy is Policy => policy !== undefined);
-
-  const allActiveModels =
-    valueModels && valueModels.length > 0
-      ? new Set([...baseContext.activeModels, ...valueModels])
-      : baseContext.activeModels;
-
-  const isModelActive = (model: Model): boolean => allActiveModels.has(model);
-
-  // Derive legacy IDs from value models, falling back to base context
-  const activeCollectionId =
-    valueModels?.find(
-      (m) => (m.constructor as typeof Model).modelName === "Collection"
-    )?.id ?? baseContext.activeCollectionId;
-
-  const activeDocumentId =
-    valueModels?.find(
-      (m) => (m.constructor as typeof Model).modelName === "Document"
-    )?.id ?? baseContext.activeDocumentId;
-
-  const contextValue: ActionContextType = {
-    ...baseContext,
-    ...overrides,
-    activeCollectionId,
-    activeDocumentId,
-    getActiveModels,
-    getActiveModel,
-    getActivePolicies,
-    isModelActive,
-    activeModels: allActiveModels,
-  };
+    history,
+    valueModels,
+    isMenu,
+    isCommandBar,
+    isButton,
+    sidebarContext,
+    event,
+  ]);
 
   return (
     <ActionContext.Provider value={contextValue}>
       {children}
     </ActionContext.Provider>
   );
-});
+}
+
+/**
+ * Merges objects in the same way as an object spread, but copies property
+ * descriptors so that getters are kept and evaluated on access.
+ *
+ * @param base the object to extend.
+ * @param overrides the properties that replace those of `base`.
+ * @returns a new object with the properties of both.
+ */
+function mergeLazy<T extends object>(base: T, overrides: Partial<T>): T {
+  return Object.defineProperties({} as T, {
+    ...Object.getOwnPropertyDescriptors(base),
+    ...Object.getOwnPropertyDescriptors(overrides),
+  });
+}
+
+/**
+ * Returns the same object reference across calls as long as `value`'s own
+ * enumerable properties are shallowly equal to the previous call's. Callers
+ * that pass overrides to `useActionContext` supply a fresh object literal on
+ * every render, which would otherwise give the merged result a new identity
+ * each time and defeat memoization (e.g. useMemo/useComputed) in consumers.
+ *
+ * @param value the object to stabilize.
+ * @returns `value`, or the previous call's return value if shallowly equal.
+ */
+function useStableValue<T extends object>(value: T): T {
+  const ref = useRef(value);
+
+  const isEqual =
+    shallowEqual(Object.keys(ref.current), Object.keys(value)) &&
+    shallowEqual(Object.values(ref.current), Object.values(value));
+
+  if (!isEqual) {
+    ref.current = value;
+  }
+
+  return ref.current;
+}
 
 /**
  * Hook to get the current action context, an object that is passed to all
@@ -173,15 +257,24 @@ export default function useActionContext(
 ): ActionContextType {
   const contextValue = useContext(ActionContext);
 
-  // If we have a context value from a provider, use it as the base
-  if (contextValue) {
-    return {
-      ...contextValue,
-      ...overrides,
-    };
+  if (!contextValue) {
+    throw new Error(
+      "useActionContext must be used within an ActionContextProvider"
+    );
   }
 
-  throw new Error(
-    "useActionContext must be used within an ActionContextProvider"
+  // Stabilize the reference so callers that memoize on the returned context
+  // (e.g. DropdownMenu's `useComputed`) don't invalidate on every render
+  // just because `overrides` is a new object literal each time. The getters of
+  // the context are not evaluated here, so that consumers do not observe them
+  // unless they are used.
+  const stableOverrides = useStableValue(overrides ?? EMPTY_OVERRIDES);
+
+  return useMemo(
+    () =>
+      Object.keys(stableOverrides).length > 0
+        ? mergeLazy(contextValue, stableOverrides)
+        : contextValue,
+    [contextValue, stableOverrides]
   );
 }

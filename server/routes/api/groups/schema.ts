@@ -1,7 +1,9 @@
 import { z } from "zod";
 import { GroupPermission } from "@shared/types";
 import { GroupValidation } from "@shared/validations";
+import { ValidateColor } from "@server/validation";
 import { Group } from "@server/models";
+import { zodIconType } from "@server/utils/zod";
 
 const BaseIdSchema = z.object({
   /** Group Id */
@@ -55,16 +57,23 @@ export type GroupsInfoReq = z.infer<typeof GroupsInfoSchema>;
 export const GroupsCreateSchema = z.object({
   body: z.object({
     /** Group name */
-    name: z.string(),
+    name: z.string().max(GroupValidation.maxNameLength),
     /** Group description */
     description: z
       .string()
       .max(GroupValidation.maxDescriptionLength)
       .optional(),
+    /** Group icon or emoji */
+    icon: zodIconType().nullish(),
+    /** Group icon color */
+    color: z
+      .string()
+      .regex(ValidateColor.regex, { message: ValidateColor.message })
+      .nullish(),
     /** Optionally link this group to an external source. */
     externalId: z.string().optional(),
     /** Whether mentions are disabled for this group */
-    disableMentions: z.boolean().optional().prefault(false),
+    disableMentions: z.boolean().prefault(false),
   }),
 });
 
@@ -73,12 +82,19 @@ export type GroupsCreateReq = z.infer<typeof GroupsCreateSchema>;
 export const GroupsUpdateSchema = z.object({
   body: BaseIdSchema.extend({
     /** Group name */
-    name: z.string().optional(),
+    name: z.string().max(GroupValidation.maxNameLength).optional(),
     /** Group description */
     description: z
       .string()
       .max(GroupValidation.maxDescriptionLength)
       .optional(),
+    /** Group icon or emoji */
+    icon: zodIconType().nullish(),
+    /** Group icon color */
+    color: z
+      .string()
+      .regex(ValidateColor.regex, { message: ValidateColor.message })
+      .nullish(),
     /** Optionally link this group to an external source. */
     externalId: z.string().optional(),
     /** Whether mentions are disabled for this group */
@@ -119,10 +135,7 @@ export const GroupsAddUserSchema = z.object({
     /** User Id */
     userId: z.uuid(),
     /** The permission of the user in the group */
-    permission: z
-      .enum(GroupPermission)
-      .optional()
-      .prefault(GroupPermission.Member),
+    permission: z.enum(GroupPermission).optional(),
   }),
 });
 

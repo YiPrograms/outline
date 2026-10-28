@@ -4,7 +4,6 @@ import * as React from "react";
 import { useTranslation } from "react-i18next";
 import styled, { useTheme } from "styled-components";
 import Squircle from "@shared/components/Squircle";
-import { Pagination } from "@shared/constants";
 import { s } from "@shared/styles";
 import { CollectionPermission, IconType } from "@shared/types";
 import { determineIconType } from "@shared/utils/icon";
@@ -43,6 +42,8 @@ type Props = {
   onRequestClose: () => void;
   /** Whether the popover is visible. */
   visible: boolean;
+  /** Whether the share data is currently loading. */
+  loading: boolean;
 };
 
 export const AccessControlList = observer(
@@ -53,18 +54,27 @@ export const AccessControlList = observer(
     sharedParent,
     onRequestClose,
     visible,
+    loading,
   }: Props) => {
     const { t } = useTranslation();
     const theme = useTheme();
     const collection = document.collection;
     const usersInCollection = useUsersInCollection(collection);
     const user = useCurrentUser();
-    const { userMemberships, groupMemberships } = useStores();
+    const { groupMemberships, users } = useStores();
     const collectionSharingDisabled = document.collection?.sharing === false;
     const team = useCurrentTeam();
     const can = usePolicy(document);
     const canCollection = usePolicy(collection);
     const documentId = document.id;
+    const ownerId = document.ownerId;
+    const owner = ownerId ? users.get(ownerId) : undefined;
+
+    React.useEffect(() => {
+      if (ownerId && !owner) {
+        void users.fetch(ownerId);
+      }
+    }, [ownerId, owner, users]);
 
     const containerRef = React.useRef<HTMLDivElement | null>(null);
     const publicAccessRef = React.useRef<HTMLDivElement | null>(null);
@@ -75,36 +85,10 @@ export const AccessControlList = observer(
       margin: 24,
     });
 
-    const { loading: userMembershipLoading, request: fetchUserMemberships } =
-      useRequest(
-        React.useCallback(
-          () =>
-            userMemberships.fetchDocumentMemberships({
-              id: documentId,
-              limit: Pagination.defaultLimit,
-            }),
-          [userMemberships, documentId]
-        )
-      );
-
-    const { loading: groupMembershipLoading, request: fetchGroupMemberships } =
-      useRequest(
-        React.useCallback(
-          () => groupMemberships.fetchAll({ documentId }),
-          [groupMemberships, documentId]
-        )
-      );
-
     const hasMemberships =
       groupMemberships.inDocument(documentId)?.length > 0 ||
       document.members.length > 0;
-    const showLoading =
-      !hasMemberships && (groupMembershipLoading || userMembershipLoading);
-
-    React.useEffect(() => {
-      void fetchUserMemberships();
-      void fetchGroupMemberships();
-    }, [fetchUserMemberships, fetchGroupMemberships]);
+    const showLoading = !hasMemberships && loading;
 
     React.useEffect(() => {
       calcMaxHeight();
@@ -161,7 +145,7 @@ export const AccessControlList = observer(
               ) : usersInCollection ? (
                 <ListItem
                   image={<CollectionSquircle collection={collection} />}
-                  title={collection.name}
+                  title={collection.displayName}
                   subtitle={t("Everyone in the collection")}
                   actions={<AccessTooltip>{t("Can view")}</AccessTooltip>}
                 />
@@ -170,7 +154,11 @@ export const AccessControlList = observer(
                   image={<Avatar model={user} />}
                   title={user.name}
                   subtitle={t("You have full access")}
-                  actions={<AccessTooltip>{t("Can edit")}</AccessTooltip>}
+                  actions={
+                    collection.isPersonal ? undefined : (
+                      <AccessTooltip>{t("Can edit")}</AccessTooltip>
+                    )
+                  }
                 />
               )}
               {showLoading ? (
@@ -184,6 +172,20 @@ export const AccessControlList = observer(
             </>
           ) : (
             <>
+              {owner && (
+                <ListItem
+                  image={<Avatar model={owner} />}
+                  title={owner.name}
+                  subtitle={t("Owner")}
+                  actions={
+                    <AccessTooltip
+                      content={t("This document is in their personal space")}
+                    >
+                      {t("Can edit")}
+                    </AccessTooltip>
+                  }
+                />
+              )}
               {showLoading ? (
                 <Placeholder />
               ) : (
@@ -192,22 +194,24 @@ export const AccessControlList = observer(
                   invitedInSession={invitedInSession}
                 />
               )}
-              <ListItem
-                image={
-                  <Squircle color={theme.accent} size={AvatarSize.Medium}>
-                    <MoreIcon color={theme.accentText} size={16} />
-                  </Squircle>
-                }
-                title={t("Other people")}
-                subtitle={t("Other workspace members may have access")}
-                actions={
-                  <AccessTooltip
-                    content={t(
-                      "This document may be shared with more workspace members through a parent document or collection you do not have access to"
-                    )}
-                  />
-                }
-              />
+              {!ownerId && (
+                <ListItem
+                  image={
+                    <Squircle color={theme.accent} size={AvatarSize.Medium}>
+                      <MoreIcon color={theme.accentText} size={16} />
+                    </Squircle>
+                  }
+                  title={t("Other people")}
+                  subtitle={t("Other workspace members may have access")}
+                  actions={
+                    <AccessTooltip
+                      content={t(
+                        "This document may be shared with more workspace members through a parent document or collection you do not have access to"
+                      )}
+                    />
+                  }
+                />
+              )}
             </>
           )}
         </ScrollableContainer>
@@ -271,15 +275,17 @@ const CollectionSquircle = ({ collection }: { collection: Collection }) => {
 
 function useUsersInCollection(collection?: Collection) {
   const { users, memberships } = useStores();
-  const { request } = useRequest(() =>
-    memberships.fetchPage({ limit: 1, id: collection!.id })
+  const fetchMemberships = React.useCallback(
+    () => memberships.fetchPage({ limit: 1, id: collection!.id }),
+    [memberships, collection]
   );
+  const { request } = useRequest(fetchMemberships);
 
   React.useEffect(() => {
     if (collection && !collection.permission) {
       void request();
     }
-  }, [collection]);
+  }, [collection, request]);
 
   return collection
     ? collection.permission

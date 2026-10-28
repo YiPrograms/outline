@@ -1,22 +1,44 @@
+// @vitest-isolate true
+import zlib from "node:zlib";
+import { errors as formidableErrors } from "formidable";
 import type Koa from "koa";
+import { DatabaseError } from "sequelize";
+import type { Mock } from "vitest";
 import { requestErrorHandler } from "@server/logging/sentry";
 import { InternalError, ValidationError, NotFoundError } from "./errors";
 import onerror from "./onerror";
 
 // Mock the requestErrorHandler from Sentry
-jest.mock("@server/logging/sentry", () => ({
-  requestErrorHandler: jest.fn(),
+vi.mock("@server/logging/sentry", () => ({
+  requestErrorHandler: vi.fn(),
 }));
+
+type MockCtx = {
+  headers: Record<string, string>;
+  headerSent: boolean;
+  writable: boolean;
+  accepts: Mock;
+  set: Mock;
+  res: { end: Mock; statusCode: number };
+  status: number | undefined;
+  type: string | undefined;
+  body: unknown;
+};
+
+type ReportableError = Error & {
+  status?: number;
+  isReportable?: boolean;
+};
 
 describe("onerror", () => {
   let app: Koa;
-  let ctx: any;
+  let ctx: MockCtx;
 
   beforeEach(() => {
     // Create a mock Koa app
     app = {
       context: {},
-    } as any;
+    } as unknown as Koa;
 
     // Apply the onerror middleware
     onerror(app);
@@ -26,10 +48,11 @@ describe("onerror", () => {
       headers: {},
       headerSent: false,
       writable: true,
-      accepts: jest.fn(() => "json"),
-      set: jest.fn(),
+      accepts: vi.fn(() => "json"),
+      set: vi.fn(),
       res: {
-        end: jest.fn(),
+        end: vi.fn(),
+        statusCode: 404,
       },
       status: undefined,
       type: undefined,
@@ -37,7 +60,7 @@ describe("onerror", () => {
     };
 
     // Clear mock calls
-    (requestErrorHandler as jest.Mock).mockClear();
+    (requestErrorHandler as Mock).mockClear();
   });
 
   it("should report InternalError to Sentry", () => {
@@ -68,7 +91,7 @@ describe("onerror", () => {
   });
 
   it("should report unknown errors without isReportable property to Sentry", () => {
-    const error = new Error("Unknown error") as any;
+    const error = new Error("Unknown error") as ReportableError;
     error.status = 500;
 
     app.context.onerror.call(ctx, error);
@@ -77,7 +100,7 @@ describe("onerror", () => {
   });
 
   it("should report errors with invalid status codes to Sentry", () => {
-    const error = new Error("Invalid status error") as any;
+    const error = new Error("Invalid status error") as ReportableError;
     error.status = 999;
 
     app.context.onerror.call(ctx, error);
@@ -86,7 +109,7 @@ describe("onerror", () => {
   });
 
   it("should not report errors explicitly marked with isReportable: false", () => {
-    const error = new Error("Custom error") as any;
+    const error = new Error("Custom error") as ReportableError;
     error.status = 500;
     error.isReportable = false;
 
@@ -95,8 +118,80 @@ describe("onerror", () => {
     expect(requestErrorHandler).not.toHaveBeenCalled();
   });
 
+  it("should convert a canceled query into a service unavailable error", () => {
+    const parent = new Error("canceling statement due to statement timeout");
+    Object.assign(parent, { code: "57014", sql: "SELECT 1" });
+    const error = new DatabaseError(parent as never);
+
+    app.context.onerror.call(ctx, error);
+
+    expect(requestErrorHandler).toHaveBeenCalled();
+    expect(ctx.status).toBe(503);
+    expect(ctx.body).toContain("request_timeout");
+  });
+
+  it("should convert an unreadable request stream into a client closed request", () => {
+    const error = new Error("stream is not readable") as ReportableError & {
+      type?: string;
+    };
+    error.status = 500;
+    error.type = "stream.not.readable";
+
+    app.context.onerror.call(ctx, error);
+
+    expect(requestErrorHandler).not.toHaveBeenCalled();
+    expect(ctx.status).toBe(499);
+    expect(ctx.body).toContain("client_closed_request");
+  });
+
+  it.each([
+    ["br", () => zlib.brotliDecompressSync(Buffer.from("not brotli"))],
+    ["gzip", () => zlib.gunzipSync(Buffer.from("not gzip"))],
+    ["gzip", () => zlib.gunzipSync(zlib.gzipSync("truncated").subarray(0, 10))],
+  ])(
+    "should convert a %s decompression error into an invalid request",
+    (_encoding, decompress) => {
+      app.context.onerror.call(ctx, captureError(decompress));
+
+      expect(requestErrorHandler).not.toHaveBeenCalled();
+      expect(ctx.status).toBe(400);
+      expect(ctx.body).toContain("invalid_request");
+    }
+  );
+
+  it("should convert an aborted multipart upload into a client closed request", () => {
+    const error = new formidableErrors.default(
+      "Request aborted",
+      formidableErrors.aborted
+    );
+
+    app.context.onerror.call(ctx, error);
+
+    expect(requestErrorHandler).not.toHaveBeenCalled();
+    expect(ctx.status).toBe(499);
+    expect(ctx.body).toContain("client_closed_request");
+  });
+
+  it("should set the response status code when the response is not writable", () => {
+    ctx.writable = false;
+
+    app.context.onerror.call(ctx, InternalError("Test internal error"));
+
+    expect(ctx.res.statusCode).toBe(500);
+    expect(ctx.res.end).not.toHaveBeenCalled();
+  });
+
+  it("should not throw when the response is unavailable", () => {
+    ctx.writable = false;
+    Reflect.deleteProperty(ctx, "res");
+
+    expect(() =>
+      app.context.onerror.call(ctx, InternalError("Test internal error"))
+    ).not.toThrow();
+  });
+
   it("should report errors explicitly marked with isReportable: true", () => {
-    const error = new Error("Custom error") as any;
+    const error = new Error("Custom error") as ReportableError;
     error.status = 400;
     error.isReportable = true;
 
@@ -105,3 +200,14 @@ describe("onerror", () => {
     expect(requestErrorHandler).toHaveBeenCalledWith(error, ctx);
   });
 });
+
+function captureError(fn: () => unknown): Error {
+  try {
+    fn();
+  } catch (err) {
+    if (err instanceof Error) {
+      return err;
+    }
+  }
+  throw new Error("Expected function to throw");
+}

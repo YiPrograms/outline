@@ -1,11 +1,11 @@
 import type { ColumnSort } from "@tanstack/react-table";
-import deburr from "lodash/deburr";
+import { deburr } from "es-toolkit/compat";
 import { observer } from "mobx-react";
 import { PlusIcon, GroupIcon } from "outline-icons";
 import * as React from "react";
 import { useState, useMemo, useCallback, useEffect } from "react";
 import { useTranslation, Trans } from "react-i18next";
-import { useHistory, useLocation } from "react-router-dom";
+import { useHistory } from "react-router-dom";
 import { toast } from "sonner";
 import type Group from "~/models/Group";
 import { Action } from "~/components/Actions";
@@ -26,7 +26,6 @@ import { CreateGroupDialog } from "./components/GroupDialogs";
 import GroupSourceFilter from "./components/GroupSourceFilter";
 import { GroupsTable } from "./components/GroupsTable";
 import { StickyFilters } from "./components/StickyFilters";
-import { HStack } from "~/components/primitives/HStack";
 
 function getFilteredGroups(groups: Group[], query?: string, source?: string) {
   let filtered = groups;
@@ -55,7 +54,6 @@ function Groups() {
   const team = useCurrentTeam();
   const can = usePolicy(team);
   const history = useHistory();
-  const location = useLocation();
   const params = useQuery();
   const [query, setQuery] = useState("");
 
@@ -101,11 +99,11 @@ function Groups() {
       }
 
       history.replace({
-        pathname: location.pathname,
+        pathname: history.location.pathname,
         search: params.toString(),
       });
     },
-    [params, history, location.pathname]
+    [params, history]
   );
 
   const handleSourceFilter = useCallback(
@@ -171,18 +169,16 @@ function Groups() {
       ) : (
         <>
           <StickyFilters>
-            <HStack>
-              <InputSearch
-                short
-                value={query}
-                placeholder={`${t("Filter")}…`}
-                onChange={handleSearch}
-              />
-              <LargeGroupSourceFilter
-                activeKey={reqParams.source ?? ""}
-                onSelect={handleSourceFilter}
-              />
-            </HStack>
+            <InputSearch
+              short
+              value={query}
+              placeholder={`${t("Filter")}…`}
+              onChange={handleSearch}
+            />
+            <LargeGroupSourceFilter
+              activeKey={reqParams.source ?? ""}
+              onSelect={handleSourceFilter}
+            />
           </StickyFilters>
           <ConditionalFade animate={!data}>
             <GroupsTable

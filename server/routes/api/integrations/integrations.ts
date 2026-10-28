@@ -1,14 +1,16 @@
-import Router from "koa-router";
+import Router from "@koa/router";
 import type { WhereOptions } from "sequelize";
 import { Op } from "sequelize";
 import { IntegrationType, UserRole } from "@shared/types";
 import auth from "@server/middlewares/authentication";
+import { rateLimiter } from "@server/middlewares/rateLimiter";
 import { transaction } from "@server/middlewares/transaction";
 import validate from "@server/middlewares/validate";
 import Integration from "@server/models/Integration";
 import { authorize } from "@server/policies";
 import { presentIntegration, presentPolicies } from "@server/presenters";
 import type { APIContext } from "@server/types";
+import { RateLimiterStrategy } from "@server/utils/RateLimiter";
 import pagination from "../middlewares/pagination";
 import * as T from "./schema";
 
@@ -47,7 +49,7 @@ router.post(
     };
 
     const [integrations, total] = await Promise.all([
-      await Integration.findAll({
+      Integration.findAll({
         where,
         order: [[sort, direction]],
         offset: ctx.state.pagination.offset,
@@ -60,7 +62,9 @@ router.post(
 
     ctx.body = {
       pagination: { ...ctx.state.pagination, total },
-      data: integrations.map(presentIntegration),
+      data: integrations.map((integration) =>
+        presentIntegration(ctx, integration)
+      ),
       policies: presentPolicies(user, integrations),
     };
   }
@@ -68,6 +72,7 @@ router.post(
 
 router.post(
   "integrations.create",
+  rateLimiter(RateLimiterStrategy.TwentyFivePerMinute),
   auth({ role: UserRole.Admin }),
   validate(T.IntegrationsCreateSchema),
   transaction(),
@@ -86,7 +91,7 @@ router.post(
     });
 
     ctx.body = {
-      data: presentIntegration(integration),
+      data: presentIntegration(ctx, integration),
       policies: presentPolicies(user, [integration]),
     };
   }
@@ -106,7 +111,7 @@ router.post(
     authorize(user, "read", integration);
 
     ctx.body = {
-      data: presentIntegration(integration),
+      data: presentIntegration(ctx, integration),
       policies: presentPolicies(user, [integration]),
     };
   }
@@ -128,18 +133,20 @@ router.post(
     });
     authorize(user, "update", integration);
 
-    if (integration.type === IntegrationType.Post) {
+    if (events !== undefined && integration.type === IntegrationType.Post) {
       integration.events = events.filter((event: string) =>
         ["documents.update", "documents.publish"].includes(event)
       );
     }
 
-    integration.settings = settings;
+    if (settings !== undefined) {
+      integration.settings = settings;
+    }
 
     await integration.saveWithCtx(ctx);
 
     ctx.body = {
-      data: presentIntegration(integration),
+      data: presentIntegration(ctx, integration),
       policies: presentPolicies(user, [integration]),
     };
   }

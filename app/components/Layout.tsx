@@ -1,14 +1,15 @@
 import { AnimatePresence } from "framer-motion";
 import { observer } from "mobx-react";
 import * as React from "react";
-import { Helmet } from "react-helmet-async";
 import type { DefaultTheme } from "styled-components";
 import styled from "styled-components";
-import breakpoint from "styled-components-breakpoint";
+import { breakpoint } from "@shared/styles/breakpoint";
 import { s } from "@shared/styles";
 import Flex from "~/components/Flex";
 import { LoadingIndicatorBar } from "~/components/LoadingIndicator";
+import { FallbackPageTitle } from "~/components/PageTitle";
 import { useRightSidebarContent } from "~/components/RightSidebarContext";
+import { SidebarCollapsedProvider } from "~/components/SidebarCollapsedContext";
 import SkipNavContent from "~/components/SkipNavContent";
 import SkipNavLink from "~/components/SkipNavLink";
 import env from "~/env";
@@ -21,52 +22,61 @@ type Props = {
   title?: string;
   /** Left sidebar content. */
   sidebar?: React.ReactNode;
+  /** Whether the sidebar can be collapsed, defaults to true. */
+  sidebarCanCollapse?: boolean;
+  ref?: React.Ref<HTMLDivElement>;
 };
 
-const Layout = React.forwardRef(function Layout_(
-  { title, children, sidebar }: Props,
-  ref: React.RefObject<HTMLDivElement>
-) {
+function Layout({
+  title,
+  children,
+  sidebar,
+  sidebarCanCollapse = true,
+  ref,
+}: Props) {
   const { ui } = useStores();
-  const sidebarCollapsed = !sidebar || ui.sidebarIsClosed;
+  const showSidebar = !!sidebar && !ui.sidebarHidden;
+  const sidebarCollapsed =
+    !showSidebar || (ui.sidebarIsClosed && sidebarCanCollapse);
   const sidebarRight = useRightSidebarContent();
 
   return (
-    <Container column auto ref={ref}>
-      <Helmet>
-        <title>{title ? title : env.APP_NAME}</title>
-      </Helmet>
+    <FallbackPageTitle title={title ? title : env.APP_NAME}>
+      <SidebarCollapsedProvider value={showSidebar && sidebarCollapsed}>
+        <Container column auto ref={ref}>
+          <SkipNavLink />
 
-      <SkipNavLink />
+          {ui.progressBarVisible && <LoadingIndicatorBar />}
 
-      {ui.progressBarVisible && <LoadingIndicatorBar />}
+          <Container auto>
+            {showSidebar && sidebar}
 
-      <Container auto>
-        {sidebar}
+            <SkipNavContent />
+            <Content
+              auto
+              justify="center"
+              role="main"
+              $isResizing={ui.sidebarIsResizing}
+              $sidebarCollapsed={sidebarCollapsed}
+              $hasSidebar={showSidebar}
+              style={
+                sidebarCollapsed
+                  ? undefined
+                  : {
+                      marginInlineStart: `${ui.sidebarWidth}px`,
+                    }
+              }
+            >
+              {children}
+            </Content>
 
-        <SkipNavContent />
-        <Content
-          auto
-          justify="center"
-          $isResizing={ui.sidebarIsResizing}
-          $sidebarCollapsed={sidebarCollapsed}
-          $hasSidebar={!!sidebar}
-          style={
-            sidebarCollapsed
-              ? undefined
-              : {
-                  marginLeft: `${ui.sidebarWidth}px`,
-                }
-          }
-        >
-          {children}
-        </Content>
-
-        <AnimatePresence initial={false}>{sidebarRight}</AnimatePresence>
-      </Container>
-    </Container>
+            <AnimatePresence initial={false}>{sidebarRight}</AnimatePresence>
+          </Container>
+        </Container>
+      </SidebarCollapsedProvider>
+    </FallbackPageTitle>
   );
-});
+}
 
 const Container = styled(Flex)`
   background: ${s("background")};
@@ -85,21 +95,21 @@ type ContentProps = {
 const Content = styled(Flex)<ContentProps>`
   margin: 0;
   transition: ${(props) =>
-    props.$isResizing ? "none" : `margin-left 100ms ease-out`};
+    props.$isResizing ? "none" : `margin-inline-start 100ms ease-out`};
 
   @media print {
     margin: 0 !important;
   }
 
   ${breakpoint("mobile", "tablet")`
-    margin-left: 0 !important;
+    margin-inline-start: 0 !important;
   `}
 
   ${breakpoint("tablet")`
     ${(props: ContentProps) =>
       props.$hasSidebar &&
       props.$sidebarCollapsed &&
-      `margin-left: ${props.theme.sidebarCollapsedWidth}px;`}
+      `margin-inline-start: ${props.theme.sidebarCollapsedWidth}px;`}
   `};
 `;
 

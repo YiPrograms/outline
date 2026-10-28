@@ -1,24 +1,78 @@
-import pick from "lodash/pick";
-import { observable, action, toJS } from "mobx";
+import { isEqual, pick } from "es-toolkit/compat";
+import { action, makeObservable, observable, toJS } from "mobx";
 import type { JSONObject } from "@shared/types";
 import type Store from "~/stores/base/Store";
+import type { PartialExcept } from "~/types";
 import Logger from "~/utils/Logger";
-import { getFieldsForModel } from "../decorators/Field";
+import { getFieldsForModel, getFieldsForModelClass } from "../decorators/Field";
 import { LifecycleManager } from "../decorators/Lifecycle";
 import { getRelationsForModelClass } from "../decorators/Relation";
-import { isEqual } from "lodash";
+
+/**
+ * MobX records decorator annotations on the prototype under a symbol with this
+ * description.
+ */
+const storedAnnotationsDescription = "mobx-stored-annotations";
+
+/**
+ * Returns the keys of every decorated member on a model, including those
+ * inherited from base classes. The nearest record on the prototype chain
+ * already includes the parents' annotations, so the search stops there.
+ *
+ * With `useDefineForClassFields: false` a field declared without an initializer
+ * never exists on the instance, so MobX cannot annotate it. This helper, and
+ * the pre-definition in `initialize`, can be removed if that compiler option
+ * is enabled.
+ *
+ * @param target the model to inspect.
+ * @returns the keys annotated with a MobX decorator.
+ */
+function getAnnotatedKeysForModel(target: Model): (string | symbol)[] {
+  let prototype = Object.getPrototypeOf(target);
+
+  while (prototype && prototype !== Object.prototype) {
+    const symbol = Object.getOwnPropertySymbols(prototype).find(
+      (candidate) => candidate.description === storedAnnotationsDescription
+    );
+    if (symbol) {
+      const annotations: Record<string | symbol, unknown> = Reflect.get(
+        prototype,
+        symbol
+      );
+      return Reflect.ownKeys(annotations);
+    }
+    prototype = Object.getPrototypeOf(prototype);
+  }
+
+  return [];
+}
 
 export default abstract class Model {
   static modelName: string;
+
+  /**
+   * Restores data written by toPersisted to the shape the model expects,
+   * discarding any properties that are not declared fields. Records written by
+   * a different version of the app may not match the current model.
+   *
+   * @param record the persisted representation of a model.
+   * @returns the data to construct or update a model with.
+   */
+  static fromPersisted<T extends Model>(
+    record: Record<string, unknown>
+  ): PartialExcept<T, "id"> {
+    const fields = getFieldsForModelClass(this);
+    return JSON.parse(JSON.stringify(pick(record, ["id", ...fields])));
+  }
 
   @observable
   id: string;
 
   @observable
-  isSaving: boolean;
+  isSaving = false;
 
   @observable
-  isNew: boolean;
+  isNew = false;
 
   @observable
   createdAt: string;
@@ -28,10 +82,40 @@ export default abstract class Model {
 
   store: Store<Model>;
 
-  constructor(fields: Record<string, any>, store: Store<Model>) {
+  constructor(_fields: Record<string, unknown>, store: Store<Model>) {
     this.store = store;
+  }
+
+  /**
+   * Applies the initial data and makes the instance observable.
+   *
+   * Call this from the constructor of the most-derived class. MobX can only
+   * annotate fields that already exist on the instance, and a subclass's fields
+   * do not exist until its own constructor has run.
+   *
+   * @param fields the data to construct the model with.
+   */
+  protected initialize(fields: Record<string, unknown>) {
+    const declared = [
+      ...getFieldsForModel(this),
+      ...getAnnotatedKeysForModel(this),
+    ];
+    for (const field of declared) {
+      if (field in this) {
+        continue;
+      }
+
+      Object.defineProperty(this, field, {
+        configurable: true,
+        enumerable: true,
+        value: undefined,
+        writable: true,
+      });
+    }
+
     this.updateData(fields);
     this.isNew = !this.id;
+    makeObservable(this);
     this.initialized = true;
   }
 
@@ -43,7 +127,7 @@ export default abstract class Model {
   async loadRelations(
     this: Model,
     options: { withoutPolicies?: boolean } = {}
-  ): Promise<any> {
+  ): Promise<unknown> {
     // this is to ensure that multiple loads don’t happen in parallel
     if (this.loadingRelations) {
       return this.loadingRelations;
@@ -60,7 +144,7 @@ export default abstract class Model {
         const store = this.store.rootStore.getStoreForModelName(
           properties.relationClassResolver().modelName
         );
-        if ("fetch" in store) {
+        if ("canFetchById" in store && store.canFetchById) {
           const id = this[properties.idKey];
           if (id) {
             promises.push(store.fetch(id as string));
@@ -70,7 +154,7 @@ export default abstract class Model {
     }
 
     const policy = this.store.rootStore.policies.get(this.id);
-    if (!policy && !options.withoutPolicies) {
+    if (!policy && !options.withoutPolicies && this.store.canFetchById) {
       promises.push(this.store.fetch(this.id, { force: true }));
     }
 
@@ -90,7 +174,7 @@ export default abstract class Model {
    * @returns A promise that resolves with the updated model
    */
   save = async (
-    params?: Record<string, any>,
+    params?: Record<string, unknown>,
     options?: Record<string, string | boolean | number | undefined>
   ): Promise<Model> => {
     const isNew = this.isNew;
@@ -120,7 +204,7 @@ export default abstract class Model {
       );
 
       // if saving is successful set the new values on the model itself
-      this.updateData({ ...params, ...model });
+      this.updateData(Object.assign({}, params, model));
 
       if (isNew) {
         LifecycleManager.executeHooks(this.constructor, "afterCreate", this);
@@ -134,12 +218,13 @@ export default abstract class Model {
     }
   };
 
-  updateData = action((data: Partial<Model>) => {
+  updateData = action((data: Record<string, unknown>) => {
     if (this.initialized) {
       LifecycleManager.executeHooks(this.constructor, "beforeChange", this);
     }
 
     const previousAttributes = this.toAPI();
+    let addedKeys = false;
 
     for (const key in data) {
       try {
@@ -147,15 +232,22 @@ export default abstract class Model {
         if (key === "initialized") {
           continue;
         }
-        // @ts-expect-error TODO
-        if (isEqual(toJS(this[key]), data[key])) {
+        if (isEqual(toJS(Reflect.get(this, key)), data[key])) {
           continue;
         }
-        // @ts-expect-error TODO
-        this[key] = data[key];
+        // A field declared without a default does not exist until it is first
+        // assigned, so MobX could not annotate it when the model was created.
+        addedKeys ||= !(key in this);
+        Reflect.set(this, key, data[key]);
       } catch (error) {
-        Logger.warn(`Error setting ${key} on model`, error);
+        Logger.warn(`Error setting ${key} on model`, { error });
       }
+    }
+
+    // Annotate any field that this payload introduced. Re-annotating a field
+    // that is already observable is a no-op.
+    if (addedKeys && this.initialized) {
+      makeObservable(this);
     }
 
     this.isNew = false;
@@ -197,10 +289,20 @@ export default abstract class Model {
    *
    * @returns A plain object representation of the model
    */
-  toAPI = (): Record<string, any> => {
+  toAPI = (): Partial<Model> => {
     const fields = getFieldsForModel(this);
     return pick(this, fields);
   };
+
+  /**
+   * Returns a plain object representation of the model, containing its
+   * identifier and declared fields only, safe to store outside of memory.
+   * Internal state and observables are not included.
+   *
+   * @returns A plain object representation of the model
+   */
+  toPersisted = (): PartialExcept<Model, "id"> =>
+    JSON.parse(JSON.stringify({ ...this.toAPI(), id: this.id }));
 
   /**
    * Returns a plain object representation of all the properties on the model
@@ -247,7 +349,7 @@ export default abstract class Model {
   protected persistedAttributes: Partial<Model> = {};
 
   /** A promise that resolves when all relations have been loaded. */
-  private loadingRelations: Promise<any[]> | undefined;
+  private loadingRelations: Promise<unknown[]> | undefined;
 
   /** A boolean representing if the constructor has been called. */
   private initialized = false;

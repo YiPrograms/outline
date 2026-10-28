@@ -2,8 +2,8 @@ import { ExpandedIcon } from "outline-icons";
 import { ellipsis } from "polished";
 import { Link } from "react-router-dom";
 import styled, { css } from "styled-components";
-import breakpoint from "styled-components-breakpoint";
-import { depths, s } from "@shared/styles";
+import { breakpoint } from "@shared/styles/breakpoint";
+import { depths, s, borderRadius } from "@shared/styles";
 import Scrollable from "~/components/Scrollable";
 import { fadeAndScaleIn } from "~/styles/animations";
 
@@ -16,7 +16,7 @@ type BaseMenuItemProps = {
 const BaseMenuItemCSS = css<BaseMenuItemProps>`
   position: relative;
   display: flex;
-  justify-content: left;
+  justify-content: flex-start;
   align-items: center;
   width: 100%;
   min-height: 32px;
@@ -98,16 +98,19 @@ export const MenuButton = styled.button<MenuButtonProps>`
   ${BaseMenuItemCSS}
 `;
 
-export const MenuInternalLink = styled(Link)`
+export const MenuInternalLink = styled(Link)<BaseMenuItemProps>`
   ${BaseMenuItemCSS}
 `;
 
-export const MenuExternalLink = styled.a`
+export const MenuExternalLink = styled.a<BaseMenuItemProps>`
   ${BaseMenuItemCSS}
 `;
 
 export const MenuSubTrigger = styled.div<BaseMenuItemProps>`
   ${BaseMenuItemCSS}
+  // Reserve space for the absolutely-positioned disclosure arrow so long
+  // labels truncate before it rather than overlapping.
+  padding-inline-end: 32px;
 `;
 
 export const MenuSeparator = styled.hr`
@@ -129,20 +132,25 @@ export const MenuHeader = styled.h3`
   color: ${s("sidebarText")};
   letter-spacing: 0.04em;
   margin: 1em 12px 0.5em;
+  user-select: none;
 `;
 
 export const MenuDisclosure = styled(ExpandedIcon)`
   transform: rotate(270deg);
   position: absolute;
-  right: 8px;
+  inset-inline-end: 8px;
   color: ${s("textTertiary")};
+
+  [dir="rtl"] & {
+    transform: rotate(90deg);
+  }
 `;
 
 export const MenuIconWrapper = styled.span`
   width: 24px;
   height: 24px;
-  margin-right: 6px;
-  margin-left: -4px;
+  margin-inline-end: 6px;
+  margin-inline-start: -4px;
   color: ${s("textSecondary")};
   flex-shrink: 0;
   display: flex;
@@ -153,7 +161,7 @@ export const MenuIconWrapper = styled.span`
 export const SelectedIconWrapper = styled.span`
   width: 24px;
   height: 24px;
-  margin-right: -6px;
+  margin-inline-end: -6px;
   color: ${s("textSecondary")};
   flex-shrink: 0;
   display: flex;
@@ -161,22 +169,51 @@ export const SelectedIconWrapper = styled.span`
   justify-content: center;
 `;
 
-export const MenuContent = styled(Scrollable)<{
+export const MenuShortcut = styled.span`
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 12px;
+  font-feature-settings: "cv08", "zero";
+  color: currentColor;
+  opacity: 0.5;
+  margin-inline-start: 16px;
+  flex-shrink: 0;
+`;
+
+type MenuContentProps = {
   maxHeightVar: string;
   transformOriginVar: string;
-}>`
+};
+
+export const MenuContent = styled(Scrollable).attrs<MenuContentProps>(
+  (props) => ({
+    // Fades the last item out at the bottom edge when the menu is scrollable.
+    fadeTo: props.theme.menuBackground,
+    bottomShadow: true,
+  })
+)<MenuContentProps>`
   z-index: ${depths.menu};
   min-width: 180px;
-  max-width: 276px;
+  max-width: 320px;
   min-height: 44px;
   max-height: ${({ maxHeightVar }) => `min(85vh, var(${maxHeightVar}))`};
   font-weight: normal;
 
   background: ${s("menuBackground")};
   box-shadow: ${s("menuShadow")};
-  border-radius: 6px;
-  padding: 6px;
+  ${borderRadius(8)}
+  // Vertical spacing comes from spacers rather than padding so that the bottom
+  // fade, which is confined to the content box, can reach the menu's edge.
+  padding: 0 6px;
   outline: none;
+
+  &::before,
+  &::after {
+    content: "";
+    display: block;
+    height: 6px;
+  }
 
   transform-origin: ${({ transformOriginVar }) => `var(${transformOriginVar})`};
 

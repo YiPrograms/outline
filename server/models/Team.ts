@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { URL } from "node:url";
 import { subMinutes } from "date-fns";
 import type { InferAttributes, InferCreationAttributes } from "sequelize";
-import { type SaveOptions } from "sequelize";
+import { type FindOptions, type SaveOptions } from "sequelize";
 import { Op } from "sequelize";
 import {
   Column,
@@ -24,11 +24,18 @@ import {
   BeforeCreate,
   IsNumeric,
 } from "sequelize-typescript";
+import slugify from "slugify";
 import { isEmail } from "validator";
 import { TeamPreferenceDefaults } from "@shared/constants";
-import type { TeamPreferences } from "@shared/types";
+import type { Plan, PlanFeature, TeamPreferences } from "@shared/types";
 import { TeamPreference, UserRole } from "@shared/types";
-import { getBaseDomain, RESERVED_SUBDOMAINS } from "@shared/utils/domains";
+import {
+  getBaseDomain,
+  parseDomain,
+  RESERVED_SUBDOMAINS,
+} from "@shared/utils/domains";
+import { PlanHelper } from "@shared/utils/PlanHelper";
+import { attachmentRedirectRegex } from "@shared/utils/ProsemirrorHelper";
 import { parseEmail } from "@shared/utils/email";
 import { TeamValidation } from "@shared/validations";
 import env from "@server/env";
@@ -43,7 +50,6 @@ import Share from "./Share";
 import TeamDomain from "./TeamDomain";
 import User from "./User";
 import ParanoidModel from "./base/ParanoidModel";
-import Fix from "./decorators/Fix";
 import IsFQDN from "./validators/IsFQDN";
 import IsUrlOrRelativePath from "./validators/IsUrlOrRelativePath";
 import Length from "./validators/Length";
@@ -56,6 +62,12 @@ import { SkipChangeset } from "./decorators/Changeset";
 export enum TeamFlag {
   MarkedSafe = "markedSafe",
 }
+
+const avatarRedirectPattern = new RegExp(attachmentRedirectRegex.source, "i");
+
+const maxSubdomainLength = env.isCloudHosted
+  ? TeamValidation.maxSubdomainLength
+  : TeamValidation.maxSubdomainSelfHostedLength;
 
 @Scopes(() => ({
   withDomains: {
@@ -71,7 +83,6 @@ export enum TeamFlag {
   },
 }))
 @Table({ tableName: "teams", modelName: "team" })
-@Fix
 class Team extends ParanoidModel<
   InferAttributes<Team>,
   Partial<InferCreationAttributes<Team>>
@@ -82,7 +93,7 @@ class Team extends ParanoidModel<
     max: TeamValidation.maxNameLength,
     msg: `Team name must be between 1 and ${TeamValidation.maxNameLength} characters`,
   })
-  @Column
+  @Column(DataType.STRING)
   name: string;
 
   @AllowNull
@@ -97,14 +108,8 @@ class Team extends ParanoidModel<
   @Unique
   @Length({
     min: TeamValidation.minSubdomainLength,
-    max: env.isCloudHosted
-      ? TeamValidation.maxSubdomainLength
-      : TeamValidation.maxSubdomainSelfHostedLength,
-    msg: `subdomain must be between ${TeamValidation.minSubdomainLength} and ${
-      env.isCloudHosted
-        ? TeamValidation.maxSubdomainLength
-        : TeamValidation.maxSubdomainSelfHostedLength
-    } characters`,
+    max: maxSubdomainLength,
+    msg: `subdomain must be between ${TeamValidation.minSubdomainLength} and ${maxSubdomainLength} characters`,
   })
   @Is({
     args: [/^[a-z\d-]+$/, "i"],
@@ -114,13 +119,16 @@ class Team extends ParanoidModel<
     args: [RESERVED_SUBDOMAINS],
     msg: "You chose a restricted word, please try another.",
   })
-  @Column
+  @Column(DataType.STRING)
   subdomain: string | null;
 
   @Unique
-  @Length({ max: 255, msg: "domain must be 255 characters or less" })
+  @Length({
+    max: TeamValidation.maxDomainLength,
+    msg: `domain must be ${TeamValidation.maxDomainLength} characters or less`,
+  })
   @IsFQDN
-  @Column
+  @Column(DataType.STRING)
   domain: string | null;
 
   @IsUUID(4)
@@ -145,35 +153,66 @@ class Team extends ParanoidModel<
     this.setDataValue("avatarUrl", value);
   }
 
+  /**
+   * Returns a directly-accessible URL for the team's avatar suitable for use
+   * in contexts without authentication. Attachment is loaded and a signed (or
+   * canonical) URL is returned; any other URL is returned unchanged.
+   *
+   * @returns A promise resolving to a direct URL, or null when no avatar is set.
+   */
+  async publicAvatarUrl(): Promise<string | null> {
+    const url = this.avatarUrl;
+    if (!url) {
+      return null;
+    }
+
+    const match = avatarRedirectPattern.exec(url);
+    if (!match?.groups?.id) {
+      return url;
+    }
+
+    const attachment = await Attachment.findOne({
+      where: { id: match.groups.id, teamId: this.id },
+    });
+
+    if (!attachment) {
+      return url;
+    }
+
+    return attachment.isStoredInPublicBucket
+      ? attachment.canonicalUrl
+      : await attachment.signedUrl;
+  }
+
   @Default(true)
-  @Column
+  @Column(DataType.BOOLEAN)
   sharing: boolean;
 
   @Default(false)
-  @Column
+  @Column(DataType.BOOLEAN)
   inviteRequired: boolean;
 
   @Column(DataType.JSONB)
   signupQueryParams: { [key: string]: string } | null;
 
   @Default(true)
-  @Column
+  @Column(DataType.BOOLEAN)
   guestSignin: boolean;
 
   @Default(true)
-  @Column
+  @Column(DataType.BOOLEAN)
   passkeysEnabled: boolean;
 
   @Default(true)
-  @Column
+  @Column(DataType.BOOLEAN)
   documentEmbeds: boolean;
 
   @Default(true)
-  @Column
+  @Column(DataType.BOOLEAN)
   memberCollectionCreate: boolean;
 
   @Default(true)
-  @Column
+  @Column(DataType.BOOLEAN)
   memberTeamCreate: boolean;
 
   @Default(UserRole.Member)
@@ -200,14 +239,14 @@ class Team extends ParanoidModel<
   preferences: TeamPreferences | null;
 
   @IsDate
-  @Column
+  @Column(DataType.DATE)
   suspendedAt: Date | null;
 
   @Column(DataType.JSONB)
   flags: { [key in TeamFlag]?: number } | null;
 
   @IsDate
-  @Column
+  @Column(DataType.DATE)
   @SkipChangeset
   lastActiveAt: Date | null;
 
@@ -222,6 +261,20 @@ class Team extends ParanoidModel<
    */
   get isSuspended(): boolean {
     return !!this.suspendedAt;
+  }
+
+  /**
+   * Returns the plan that the team is on.
+   */
+  get plan(): Plan {
+    return PlanHelper.defaultPlan;
+  }
+
+  /**
+   * Returns the features that the team is entitled to use.
+   */
+  get entitlements(): PlanFeature[] {
+    return PlanHelper.getFeatures(this.plan);
   }
 
   /**
@@ -248,6 +301,20 @@ class Team extends ParanoidModel<
 
     url.host = `${this.subdomain}.${getBaseDomain()}`;
     return url.href.replace(/\/$/, "");
+  }
+
+  /**
+   * Returns whether the given url points at this team's installation, taking
+   * into account custom domains and hosted subdomains.
+   *
+   * @param url The url to check.
+   * @returns True if the url belongs to this team.
+   */
+  public isTeamUrl(url: string): boolean {
+    if (!url) {
+      return false;
+    }
+    return parseDomain(url).host === parseDomain(this.url).host;
   }
 
   /**
@@ -371,7 +438,7 @@ class Team extends ParanoidModel<
     });
   };
 
-  public collectionIds = async function (paranoid = true) {
+  public collectionIds = async (paranoid = true) => {
     const models = await Collection.findAll({
       attributes: ["id"],
       where: {
@@ -467,15 +534,15 @@ class Team extends ParanoidModel<
   static async savePreviousSubdomain(model: Team) {
     const previousSubdomain = model.previous("subdomain");
     if (previousSubdomain && previousSubdomain !== model.subdomain) {
-      model.previousSubdomains = model.previousSubdomains || [];
+      const previousSubdomains = model.previousSubdomains || [];
 
-      if (!model.previousSubdomains.includes(previousSubdomain)) {
-        // Add the previous subdomain to the list of previous subdomains
-        // upto a maximum of 3 previous subdomains
-        model.previousSubdomains.push(previousSubdomain);
-        if (model.previousSubdomains.length > 3) {
-          model.previousSubdomains.shift();
-        }
+      if (!previousSubdomains.includes(previousSubdomain)) {
+        // Assign a new array, Sequelize does not detect in-place mutation.
+        // Keep up to a maximum of 3 previous subdomains.
+        model.previousSubdomains = [
+          ...previousSubdomains,
+          previousSubdomain,
+        ].slice(-3);
       }
     }
 
@@ -508,6 +575,26 @@ class Team extends ParanoidModel<
   };
 
   /**
+   * Find a team by its custom domain. The input is normalized by stripping
+   * protocol, port, path, and lowercasing to match the stored format.
+   *
+   * @param domain the domain to search for.
+   * @param options additional find options to pass to the query.
+   * @returns the team with the given domain, or null if not found.
+   */
+  static async findByDomain(domain: string, options?: FindOptions<Team>) {
+    const normalized = domain
+      .replace(/(https?:)?\/\//, "")
+      .split(/[/:?]/)[0]
+      .toLowerCase();
+
+    return this.findOne({
+      ...options,
+      where: Object.assign({}, options?.where, { domain: normalized }),
+    });
+  }
+
+  /**
    * Find a team by its current or previous subdomain.
    *
    * @param subdomain - The subdomain to search for.
@@ -523,6 +610,52 @@ class Team extends ParanoidModel<
         },
       })) || (await this.findByPreviousSubdomain(subdomain))
     );
+  }
+
+  /**
+   * Find a subdomain that is not yet in use, derived from the requested value.
+   * A trailing top-level domain is removed and the remainder is slugified,
+   * a numeric suffix is appended until a free subdomain is found. The result
+   * is truncated to fit the maximum subdomain length.
+   *
+   * @param requested - The preferred subdomain or team name.
+   * @param options - Additional find options to pass to the query.
+   * @returns An available subdomain.
+   */
+  static async findAvailableSubdomain(
+    requested: string,
+    options?: FindOptions<Team>
+  ) {
+    // strip a trailing top-level domain so "acme.com" becomes "acme"
+    const withoutTld = requested.replace(/\s*\.[a-z]{2,}\s*$/i, "");
+
+    // filter subdomain to only valid characters
+    // if there are less than the minimum length, use a default subdomain
+    const normalized = slugify(withoutTld, { lower: true, strict: true });
+    const base =
+      normalized.length < 3 || RESERVED_SUBDOMAINS.includes(normalized)
+        ? "team"
+        : normalized;
+
+    const withSuffix = (suffix: string) =>
+      `${base.slice(0, maxSubdomainLength - suffix.length).replace(/-+$/, "")}${suffix}`;
+
+    let subdomain = withSuffix("");
+    let append = 0;
+
+    for (;;) {
+      const existing = await this.findOne({
+        ...options,
+        where: { subdomain },
+        paranoid: false,
+      });
+
+      if (!existing) {
+        return subdomain;
+      }
+
+      subdomain = withSuffix(String(++append));
+    }
   }
 
   /**

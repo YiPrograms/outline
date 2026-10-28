@@ -8,6 +8,7 @@ export default function init() {
       partitionIndex: 0,
       partitionCount: 1,
     };
+    const scheduledAt = Date.now();
 
     for (const name in tasks) {
       const TaskClass = tasks[name];
@@ -15,22 +16,36 @@ export default function init() {
         continue;
       }
 
-      // @ts-expect-error We won't instantiate an abstract class
       const taskInstance = new TaskClass() as CronTask;
+      const { interval, limit, partitionWindow } = taskInstance.cron;
 
-      if (taskInstance.cron.interval === schedule) {
-        await taskInstance.schedule({ limit: 10000, partition });
+      if (interval !== schedule) {
+        continue;
       }
+
+      // Stagger the start of tasks that define a window within that window.
+      const delay = partitionWindow
+        ? CronTask.getStaggerDelay(name, interval, partitionWindow)
+        : 0;
+
+      await taskInstance.schedule(
+        {
+          limit: limit ?? 10000,
+          partition,
+          scheduledAt,
+        },
+        { delay }
+      );
     }
   }
 
-  setInterval(() => void run(TaskInterval.Day), Day.ms);
-  setInterval(() => void run(TaskInterval.Hour), Hour.ms);
+  setInterval(() => void run(TaskInterval.Day), Day.ms).unref();
+  setInterval(() => void run(TaskInterval.Hour), Hour.ms).unref();
 
   // Just give everything time to startup before running the first time. Not
   // _technically_ required to function.
   setTimeout(() => {
     void run(TaskInterval.Day);
     void run(TaskInterval.Hour);
-  }, 5 * Second.ms);
+  }, 5 * Second.ms).unref();
 }

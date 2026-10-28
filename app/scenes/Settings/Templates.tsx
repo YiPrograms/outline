@@ -1,10 +1,11 @@
 import type { ColumnSort } from "@tanstack/react-table";
-import deburr from "lodash/deburr";
+import { deburr } from "es-toolkit/compat";
 import { observer } from "mobx-react";
 import { ShapesIcon } from "outline-icons";
+import type * as React from "react";
 import { useEffect, useMemo, useCallback, useState } from "react";
 import { useTranslation, Trans } from "react-i18next";
-import { useHistory, useLocation } from "react-router-dom";
+import { useHistory } from "react-router-dom";
 import { toast } from "sonner";
 import type Template from "~/models/Template";
 import { Action } from "~/components/Actions";
@@ -40,7 +41,6 @@ function Templates() {
   const team = useCurrentTeam();
   const can = usePolicy(team);
   const history = useHistory();
-  const location = useLocation();
   const params = useQuery();
   const [query, setQuery] = useState("");
 
@@ -81,17 +81,20 @@ function Templates() {
       }
 
       history.replace({
-        pathname: location.pathname,
+        pathname: history.location.pathname,
         search: params.toString(),
       });
     },
-    [params, history, location.pathname]
+    [params, history]
   );
 
-  const handleSearch = useCallback((event) => {
-    const { value } = event.target;
-    setQuery(value);
-  }, []);
+  const handleSearch = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const { value } = event.target;
+      setQuery(value);
+    },
+    []
+  );
 
   useEffect(() => {
     if (error) {

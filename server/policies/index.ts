@@ -1,7 +1,5 @@
-// export everything from cancan
 export * from "./cancan";
 
-// Import all policies
 import "./apiKey";
 import "./attachment";
 import "./authenticationProvider";
@@ -30,3 +28,4 @@ import "./webhookSubscription";
 import "./userMembership";
 import "./userPasskey";
 import "./emoji";
+import "./accessRequest";

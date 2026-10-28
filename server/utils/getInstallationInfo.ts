@@ -1,3 +1,4 @@
+import { errToString } from "@shared/utils/error";
 import { version } from "../../package.json";
 import Logger from "@server/logging/Logger";
 import fetch from "./fetch";
@@ -10,6 +11,13 @@ function isFullReleaseVersion(versionName: string): boolean {
   return releaseRegex.test(versionName);
 }
 
+/**
+ * Fetches the latest released version from Docker Hub and calculates how many
+ * versions behind the current installation is.
+ *
+ * @param currentVersion the currently installed version.
+ * @returns the latest version and the number of versions behind, or -1 if unknown.
+ */
 export async function getVersionInfo(currentVersion: string): Promise<{
   latestVersion: string;
   versionsBehind: number;
@@ -23,11 +31,14 @@ export async function getVersionInfo(currentVersion: string): Promise<{
     // Continue fetching pages until the required versions are found or no more pages
     while (nextUrl) {
       const response = await fetch(nextUrl);
-      const data = await response.json();
+      const data = (await response.json()) as {
+        results: { name: string }[];
+        next?: string | null;
+      };
 
       // Map and filter the versions to keep only full releases
       const pageVersions = data.results
-        .map((result: any) => result.name)
+        .map((result) => result.name)
         .filter(isFullReleaseVersion);
 
       allVersions = allVersions.concat(pageVersions);
@@ -62,7 +73,7 @@ export async function getVersionInfo(currentVersion: string): Promise<{
       "Failed to fetch version information from Docker Hub. This is expected in isolated environments.",
       {
         currentVersion,
-        error: error instanceof Error ? error.message : String(error),
+        error: errToString(error),
       }
     );
 
@@ -74,6 +85,11 @@ export async function getVersionInfo(currentVersion: string): Promise<{
   }
 }
 
+/**
+ * Returns the current version of the server from the package manifest.
+ *
+ * @returns the current version.
+ */
 export function getVersion(): string {
   return version;
 }

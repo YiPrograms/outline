@@ -1,9 +1,17 @@
-import { observable } from "mobx";
+import { computed, observable } from "mobx";
 import Model from "./base/Model";
 import Field from "./decorators/Field";
+import Relation from "./decorators/Relation";
+import type { Searchable } from "./interfaces/Searchable";
+import User from "./User";
 
-class WebhookSubscription extends Model {
+class WebhookSubscription extends Model implements Searchable {
   static modelName = "WebhookSubscription";
+
+  constructor(fields: Record<string, unknown>, store: Model["store"]) {
+    super(fields, store);
+    this.initialize(fields);
+  }
 
   @Field
   @observable
@@ -24,6 +32,23 @@ class WebhookSubscription extends Model {
   @Field
   @observable
   events: string[];
+
+  /** The user who created this webhook subscription. */
+  @Relation(() => User)
+  createdBy?: User;
+
+  /** The user ID that created this webhook subscription. */
+  createdById: string;
+
+  @computed
+  get searchContent(): string[] {
+    return [this.name, this.url, ...(this.events ?? [])].filter(Boolean);
+  }
+
+  @computed
+  get searchSuppressed(): boolean {
+    return false;
+  }
 }
 
 export default WebhookSubscription;

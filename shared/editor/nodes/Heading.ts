@@ -1,4 +1,6 @@
 import copy from "copy-to-clipboard";
+import { t } from "i18next";
+import type Token from "markdown-it/lib/token.mjs";
 import { textblockTypeInputRule } from "prosemirror-inputrules";
 import type {
   Node as ProsemirrorNode,
@@ -7,18 +9,14 @@ import type {
   Schema,
 } from "prosemirror-model";
 import type { Command } from "prosemirror-state";
-import { Plugin, Selection } from "prosemirror-state";
+import { Plugin, TextSelection } from "prosemirror-state";
 import { Decoration, DecorationSet } from "prosemirror-view";
-import { toast } from "sonner";
 import type { Primitive } from "utility-types";
 import { isSafari } from "../../utils/browser";
-import Storage from "../../utils/Storage";
+import { removeUrlFragment, removeUrlPathSuffix } from "../../utils/urls";
 import backspaceToParagraph from "../commands/backspaceToParagraph";
-import splitHeading from "../commands/splitHeading";
 import toggleBlockType from "../commands/toggleBlockType";
-import { headingToPersistenceKey } from "../lib/headingToSlug";
 import type { MarkdownSerializerState } from "../lib/markdown/serializer";
-import { findCollapsedNodes } from "../queries/findCollapsedNodes";
 import Node from "./Node";
 import { EditorStyleHelper } from "../styles/EditorStyleHelper";
 
@@ -29,15 +27,46 @@ export enum HeadingLevel {
   Four,
 }
 
-export default class Heading extends Node {
+/** Levels the editor offers. */
+const editorLevels = [
+  HeadingLevel.One,
+  HeadingLevel.Two,
+  HeadingLevel.Three,
+  HeadingLevel.Four,
+];
+
+/** Levels a document may hold – Markdown can also import an h5 or an h6. */
+const documentLevels = [...editorLevels, 5, 6];
+
+/**
+ * Restricts a heading level to one that can be rendered as a tag.
+ *
+ * @param value the level to restrict.
+ * @returns a level a document may hold.
+ */
+const toLevel = (value: unknown): number =>
+  documentLevels.includes(value as HeadingLevel)
+    ? (value as number)
+    : HeadingLevel.One;
+
+/**
+ * Options for the Heading node.
+ */
+type HeadingOptions = {
+  /** Heading levels (1-based) that are enabled in this editor. */
+  levels: number[];
+  /** Offset added to the rendered heading level (e.g. 1 renders an `h2` for level 1). */
+  offset?: number;
+};
+
+export default class Heading extends Node<HeadingOptions> {
   get name() {
     return "heading";
   }
 
-  get defaultOptions() {
+  get defaultOptions(): Partial<HeadingOptions> {
     return {
-      levels: [1, 2, 3, 4],
-      collapsed: undefined,
+      levels: editorLevels,
     };
   }
 
@@ -61,7 +90,9 @@ export default class Heading extends Node {
         attrs: { level },
       })),
       toDOM: (node) => [
-        `h${node.attrs.level + (this.options.offset || 0)}`,
+        // A level outside of the range produces an invalid tag name, which
+        // would stop the document rendering.
+        `h${toLevel(node.attrs.level) + (this.options.offset || 0)}`,
         {
           dir: "auto",
           class: "heading-content",
@@ -72,7 +103,7 @@ export default class Heading extends Node {
   }
 
   toMarkdown(state: MarkdownSerializerState, node: ProsemirrorNode) {
-    state.write(state.repeat("#", node.attrs.level) + " ");
+    state.write(state.repeat("#", toLevel(node.attrs.level)) + " ");
     state.renderInline(node);
     state.closeBlock(node);
   }
@@ -80,7 +111,7 @@ export default class Heading extends Node {
   parseMarkdown() {
     return {
       block: "heading",
-      getAttrs: (token: Record<string, any>) => ({
+      getAttrs: (token: Token) => ({
         level: +token.tag.slice(1),
       }),
     };
@@ -91,93 +122,58 @@ export default class Heading extends Node {
       toggleBlockType(type, schema.nodes.paragraph, attrs);
   }
 
-  handleFoldContent = (event: MouseEvent) => {
-    event.preventDefault();
-    if (
-      !(event.currentTarget instanceof HTMLButtonElement) ||
-      event.button !== 0
-    ) {
+  handleCopyLink = (event: MouseEvent) => {
+    if (!(event.currentTarget instanceof HTMLButtonElement)) {
       return;
     }
 
-    const { view } = this.editor;
-    const hadFocus = view.hasFocus();
-    const { tr } = view.state;
-    const { top, left } = event.currentTarget.getBoundingClientRect();
-    const result = view.posAtCoords({ top, left });
-
-    if (result) {
-      const node = view.state.doc.nodeAt(result.inside);
-
-      if (node) {
-        const endOfHeadingPos = result.inside + node.nodeSize;
-        const $pos = view.state.doc.resolve(endOfHeadingPos);
-        const collapsed = !node.attrs.collapsed;
-
-        if (collapsed && view.state.selection.to > endOfHeadingPos) {
-          // move selection to the end of the collapsed heading
-          tr.setSelection(Selection.near($pos, -1));
-        }
-
-        const transaction = tr.setNodeMarkup(result.inside, undefined, {
-          ...node.attrs,
-          collapsed,
-        });
-
-        const persistKey = headingToPersistenceKey(node, this.editor.props.id);
-
-        if (collapsed) {
-          Storage.set(persistKey, "collapsed");
-        } else {
-          Storage.remove(persistKey);
-        }
-
-        view.dispatch(transaction);
-
-        if (hadFocus) {
-          view.focus();
-        }
-      }
+    const heading = event.currentTarget.closest(".heading-content");
+    if (!heading) {
+      return;
     }
-  };
 
-  handleCopyLink = (event: MouseEvent) => {
-    // this is unfortunate but appears to be the best way to grab the anchor
-    // as it's added directly to the dom by a decoration.
-    const anchor =
-      event.currentTarget instanceof HTMLButtonElement &&
-      (event.currentTarget.parentNode?.parentNode
-        ?.previousSibling as HTMLElement);
-
-    if (
-      !anchor ||
-      !anchor.className.includes(EditorStyleHelper.headingPositionAnchor)
+    // Search previous siblings for the anchor element, as other elements
+    // (e.g. multiplayer cursors) may be inserted between the anchor and heading.
+    let anchor = heading.previousElementSibling;
+    while (
+      anchor &&
+      !anchor.className?.includes(EditorStyleHelper.headingPositionAnchor)
     ) {
-      throw new Error("Did not find anchor as previous sibling of heading");
+      anchor = anchor.previousElementSibling;
     }
+
+    if (!anchor) {
+      return;
+    }
+
     const hash = `#${anchor.id}`;
 
     // the existing url might contain a hash already, lets make sure to remove
-    // that rather than appending another one.
-    const normalizedUrl = window.location.href
-      .split("#")[0]
-      .replace("/edit", "");
-    copy(normalizedUrl + hash);
-
-    toast.message(this.options.dictionary.linkCopied);
+    // that rather than appending another one, along with any /edit suffix.
+    const normalizedUrl = removeUrlPathSuffix(
+      removeUrlFragment(window.location.href),
+      "/edit"
+    );
+    try {
+      copy(normalizedUrl + hash);
+      this.editor.props.onNotice?.(t("Link copied to clipboard"));
+    } catch (_err) {
+      // Some browser contexts disable the prompt() fallback used by
+      // copy-to-clipboard, causing it to throw – surface it rather than crash.
+      this.editor.props.onNotice?.(
+        t("Sorry, the link could not be copied"),
+        "error"
+      );
+    }
   };
 
   keys({ type, schema }: { type: NodeType; schema: Schema }) {
     const options = this.options.levels.reduce(
       (items: Record<string, Command>, level: number) => ({
         ...items,
-        ...{
-          [`Shift-Ctrl-${level}`]: toggleBlockType(
-            type,
-            schema.nodes.paragraph,
-            { level }
-          ),
-        },
+        [`Shift-Ctrl-${level}`]: toggleBlockType(type, schema.nodes.paragraph, {
+          level,
+        }),
       }),
       {}
     );
@@ -185,59 +181,90 @@ export default class Heading extends Node {
     return {
       ...options,
       Backspace: backspaceToParagraph(type),
-      Enter: splitHeading(type),
+      ArrowLeft: ((state, dispatch) => {
+        if (!isSafari) {
+          return false;
+        }
+
+        const { $from, empty } = state.selection;
+        if (!empty || $from.parent.type !== type) {
+          return false;
+        }
+
+        const end = $from.end();
+        if ($from.pos !== end || !$from.parent.lastChild?.isText) {
+          return false;
+        }
+
+        if (dispatch) {
+          dispatch(
+            state.tr
+              .setSelection(TextSelection.create(state.doc, end - 1))
+              .scrollIntoView()
+          );
+        }
+        return true;
+      }) as Command,
+      // Cmd+Left in Firefox lands the DOM caret inside the heading-anchor
+      // widget (contentEditable=false, ignoreSelection: true), so Prosemirror
+      // does not update its model. Subsequent commands like Enter then operate
+      // on the stale position. Move the model selection explicitly to keep it
+      // in sync with the visual caret. Note this is Cmd rather than Mod, as
+      // Ctrl+Left moves by word on other platforms.
+      "Cmd-ArrowLeft": ((state, dispatch) => {
+        const { $from, empty } = state.selection;
+        if (!empty || $from.parent.type !== type) {
+          return false;
+        }
+        const start = $from.start();
+        if ($from.pos === start) {
+          return false;
+        }
+        if (dispatch) {
+          dispatch(
+            state.tr
+              .setSelection(TextSelection.create(state.doc, start))
+              .scrollIntoView()
+          );
+        }
+        return true;
+      }) as Command,
     };
   }
 
   get plugins() {
+    // Anchor button to copy a link to the heading.
+    const createAnchor = () => {
+      const anchor = document.createElement("button");
+      anchor.innerText = "#";
+      anchor.type = "button";
+      anchor.contentEditable = "false";
+      anchor.className = "heading-anchor";
+      anchor.setAttribute("aria-label", "Copy link to heading");
+      anchor.addEventListener("mousedown", (event) =>
+        this.handleCopyLink(event)
+      );
+      return anchor;
+    };
+
     const createWidgetDecorations = (doc: ProsemirrorNode): Decoration[] => {
       const decorations: Decoration[] = [];
 
       doc.descendants((node, pos) => {
         if (node.type.name === "heading") {
-          // Create anchor button
-          const anchor = document.createElement("button");
-          anchor.innerText = "#";
-          anchor.type = "button";
-          anchor.className = "heading-anchor";
-          anchor.addEventListener("mousedown", (event) =>
-            this.handleCopyLink(event)
-          );
-
-          // Create fold button
-          const fold = document.createElement("button");
-          fold.innerText = "";
-          fold.innerHTML =
-            '<svg fill="currentColor" width="12" height="24" viewBox="6 0 12 24" xmlns="http://www.w3.org/2000/svg"><path d="M8.23823905,10.6097108 L11.207376,14.4695888 L11.207376,14.4695888 C11.54411,14.907343 12.1719566,14.989236 12.6097108,14.652502 C12.6783439,14.5997073 12.7398293,14.538222 12.792624,14.4695888 L15.761761,10.6097108 L15.761761,10.6097108 C16.0984949,10.1719566 16.0166019,9.54410997 15.5788477,9.20737601 C15.4040391,9.07290785 15.1896811,9 14.969137,9 L9.03086304,9 L9.03086304,9 C8.47857829,9 8.03086304,9.44771525 8.03086304,10 C8.03086304,10.2205442 8.10377089,10.4349022 8.23823905,10.6097108 Z" /></svg>';
-          fold.type = "button";
-          fold.className = `heading-fold ${
-            node.attrs.collapsed ? "collapsed" : ""
-          }`;
-          fold.addEventListener("mousedown", (event) =>
-            this.handleFoldContent(event)
-          );
-
-          // Create container span
-          const container = document.createElement("span");
-          container.contentEditable = "false";
-          container.className = `heading-actions ${
-            node.attrs.collapsed ? "collapsed" : ""
-          }`;
-          container.appendChild(anchor);
-          container.appendChild(fold);
-
           decorations.push(
-            // Contains the heading actions
             Decoration.widget(
               // Safari requires the widget to be placed at the end of the node rather than the beginning
               // or caret selection is not correct, browser quirk – see issue #1234
               isSafari ? pos + node.nodeSize - 1 : pos + 1,
-              container,
+              createAnchor,
               {
-                side: -1,
+                // Safari keeps this widget at the end; positive side preserves IME
+                // insertion order, while relaxed side preserves caret navigation.
+                side: isSafari ? 1 : -1,
                 ignoreSelection: true,
-                relaxedSide: false,
-                key: pos.toString(),
+                relaxedSide: isSafari,
+                key: "anchor",
               }
             )
           );
@@ -283,38 +310,7 @@ export default class Heading extends Node {
       },
     });
 
-    const foldPlugin: Plugin = new Plugin({
-      state: {
-        init(_, { doc }) {
-          const decorations: Decoration[] = findCollapsedNodes(doc).map(
-            (block) =>
-              Decoration.node(block.pos, block.pos + block.node.nodeSize, {
-                class: "folded-content",
-              })
-          );
-          return DecorationSet.create(doc, decorations);
-        },
-        apply(tr, oldDecoSet) {
-          if (tr.docChanged) {
-            const decorations: Decoration[] = findCollapsedNodes(tr.doc).map(
-              (block) =>
-                Decoration.node(block.pos, block.pos + block.node.nodeSize, {
-                  class: "folded-content",
-                })
-            );
-            return DecorationSet.create(tr.doc, decorations);
-          }
-          return oldDecoSet.map(tr.mapping, tr.doc);
-        },
-      },
-      props: {
-        decorations(state) {
-          return this.getState(state);
-        },
-      },
-    });
-
-    return [widgetsPlugin, foldPlugin];
+    return [widgetsPlugin];
   }
 
   inputRules({ type }: { type: NodeType }) {

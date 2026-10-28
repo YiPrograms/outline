@@ -1,5 +1,5 @@
 import emojiRegex from "emoji-regex";
-import deburr from "lodash/deburr";
+import { deburr } from "es-toolkit/compat";
 import naturalSort from "natural-sort";
 
 type NaturalSortOptions = {
@@ -14,18 +14,18 @@ const stripEmojis = (value: string) => value.replace(regex, "");
 
 const cleanValue = (value: string) => stripEmojis(deburr(value));
 
-function getSortByField<T extends Record<string, any>>(
+function getSortByField<T extends object>(
   item: T,
   keyOrCallback: string | ((item: T) => string)
 ) {
   const field =
     typeof keyOrCallback === "string"
-      ? item[keyOrCallback]
+      ? (item as Record<string, unknown>)[keyOrCallback]
       : keyOrCallback(item);
-  return cleanValue(field);
+  return cleanValue(typeof field === "string" ? field : "");
 }
 
-function naturalSortBy<T extends Record<string, any>>(
+function naturalSortBy<T extends object>(
   items: T[],
   key: string | ((item: T) => string),
   sortOptions?: NaturalSortOptions
@@ -40,9 +40,10 @@ function naturalSortBy<T extends Record<string, any>>(
       })
     : sorter;
 
-  return items.sort((a: T, b: T) =>
-    sort(getSortByField(a, key), getSortByField(b, key))
-  );
+  // Sort a copy, `items` may be an observable array which cannot be sorted in place.
+  return items
+    .slice()
+    .sort((a: T, b: T) => sort(getSortByField(a, key), getSortByField(b, key)));
 }
 
 export default naturalSortBy;

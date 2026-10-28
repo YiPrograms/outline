@@ -1,5 +1,4 @@
-/* oxlint-disable @typescript-eslint/no-var-requires */
-import find from "lodash/find";
+import { find } from "es-toolkit/compat";
 import env from "@server/env";
 import type Team from "@server/models/Team";
 import User from "@server/models/User";
@@ -15,6 +14,32 @@ export default class AuthenticationHelper {
    */
   public static get providers() {
     return PluginManager.getHooks(Hook.AuthProvider);
+  }
+
+  /**
+   * Returns the human-readable display name for an authentication provider.
+   *
+   * @param id The authentication provider id, eg "google".
+   * @returns The display name if known, otherwise the provided id.
+   */
+  public static getProviderName(id: string): string {
+    const provider = AuthenticationHelper.providers.find(
+      (hook) => hook.value.id === id
+    );
+    return provider?.name ?? id;
+  }
+
+  /**
+   * Returns whether an authentication provider allows sign-in to an existing
+   * account by email from a tenant that the team is not connected to.
+   *
+   * @param id The authentication provider id, eg "google".
+   * @returns True if the provider allows matching by email.
+   */
+  public static allowsEmailMatch(id: string): boolean {
+    return AuthenticationHelper.providers.some(
+      (hook) => hook.value.id === id && hook.value.allowEmailMatch === true
+    );
   }
 
   /**

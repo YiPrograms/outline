@@ -1,22 +1,28 @@
-import chunk from "lodash/chunk";
-import compact from "lodash/compact";
+import { chunk, compact } from "es-toolkit/compat";
 import * as React from "react";
+import type { ListImperativeAPI } from "react-window";
 import styled from "styled-components";
 import { IconType } from "@shared/types";
 import { IconLibrary } from "@shared/utils/IconLibrary";
 import { Emoji } from "~/components/Emoji";
 import Text from "~/components/Text";
+import useMobile from "~/hooks/useMobile";
 import { TRANSLATED_CATEGORIES } from "../utils";
 import Grid from "./Grid";
 import { IconButton } from "./IconButton";
 import { CustomEmoji } from "@shared/components/CustomEmoji";
 
 /**
- * icon/emoji size is 24px; and we add 4px padding on all sides,
+ * Desktop: 24px icon/emoji + 4px padding on all sides = 32px button.
+ * Mobile: 32px icon/emoji + 4px padding on all sides = 40px button, so
+ * roughly 8 emojis fit across a typical phone screen.
  */
-const BUTTON_SIZE = 32;
+const BUTTON_SIZE_DESKTOP = 32;
+const BUTTON_SIZE_MOBILE = 40;
+const ICON_SIZE_DESKTOP = 24;
+const ICON_SIZE_MOBILE = 32;
 
-type OutlineNode = {
+export type OutlineNode = {
   type: IconType.SVG;
   name: string;
   color: string;
@@ -31,9 +37,11 @@ export type EmojiNode = {
   name?: string;
 };
 
+export type IconNode = OutlineNode | EmojiNode;
+
 export type DataNode = {
   category: keyof typeof TRANSLATED_CATEGORIES;
-  icons: (OutlineNode | EmojiNode)[];
+  icons: IconNode[];
 };
 
 type Props = {
@@ -43,18 +51,56 @@ type Props = {
   height: number;
   /** Data to be displayed in the grid */
   data: DataNode[];
+  /** Value of the currently selected icon or emoji */
+  selected?: string | null;
   /** Content to display when search results are empty */
   empty?: React.ReactNode;
   /** Callback when an icon is selected */
   onIconSelect: ({ id, value }: { id: string; value: string }) => void;
+  /** Callback when an icon is hovered or focused */
+  onIconActive?: (icon: IconNode) => void;
+  /** Callback when whether the grid has content below the fold changes */
+  onOverflowChange?: (hasMoreBelow: boolean) => void;
+  /** Ref to the virtualized list */
+  ref?: React.Ref<ListImperativeAPI>;
 };
 
-const GridTemplate = (
-  { width, height, data, empty, onIconSelect }: Props,
-  ref: React.Ref<HTMLDivElement>
-) => {
+function GridTemplate({
+  width,
+  height,
+  data,
+  selected,
+  empty,
+  onIconSelect,
+  onIconActive,
+  onOverflowChange,
+  ref,
+}: Props) {
+  const isMobile = useMobile();
+  const buttonSize = isMobile ? BUTTON_SIZE_MOBILE : BUTTON_SIZE_DESKTOP;
+  const iconSize = isMobile ? ICON_SIZE_MOBILE : ICON_SIZE_DESKTOP;
   // 24px padding for the Grid Container
-  const itemsPerRow = Math.floor((width - 24) / BUTTON_SIZE);
+  const itemsPerRow = Math.max(1, Math.floor((width - 24) / buttonSize));
+
+  const [lastClicked, setLastClicked] = React.useState<{
+    category: DataNode["category"];
+    value: string;
+  }>();
+
+  // Highlight the selection in only one category: the one it was clicked in,
+  // otherwise the first category that contains it.
+  const containsSelected = (node: DataNode) =>
+    node.icons.some((icon) => valueOf(icon) === selected);
+  const selectedCategory = selected
+    ? (
+        data.find(
+          (node) =>
+            lastClicked?.value === selected &&
+            node.category === lastClicked.category &&
+            containsSelected(node)
+        ) ?? data.find(containsSelected)
+      )?.category
+    : undefined;
 
   const gridItems = compact(
     data.flatMap((node) => {
@@ -77,14 +123,29 @@ const GridTemplate = (
       }
 
       const items = node.icons.map((item) => {
+        const handleActive = () => onIconActive?.(item);
+        const handleSelect = (id: string, value: string) => {
+          setLastClicked({ category: node.category, value });
+          onIconSelect({ id, value });
+        };
+        const isSelected =
+          node.category === selectedCategory && valueOf(item) === selected;
+
         if (item.type === IconType.SVG) {
           return (
             <IconButton
               key={item.name}
-              onClick={() => onIconSelect({ id: item.name, value: item.name })}
+              onClick={() => handleSelect(item.name, item.name)}
+              aria-current={isSelected ? "true" : undefined}
+              onMouseEnter={handleActive}
+              onFocus={handleActive}
               style={{ "--delay": `${item.delay}ms` } as React.CSSProperties}
             >
-              <Icon as={IconLibrary.getComponent(item.name)} color={item.color}>
+              <Icon
+                as={IconLibrary.getComponent(item.name)}
+                color={item.color}
+                size={iconSize}
+              >
                 {item.initial}
               </Icon>
             </IconButton>
@@ -94,9 +155,16 @@ const GridTemplate = (
         return (
           <IconButton
             key={item.id}
-            onClick={() => onIconSelect({ id: item.id, value: item.value })}
+            onClick={() => handleSelect(item.id, item.value)}
+            aria-current={isSelected ? "true" : undefined}
+            onMouseEnter={handleActive}
+            onFocus={handleActive}
           >
-            <Emoji width={24} height={24}>
+            <Emoji
+              width={iconSize}
+              height={iconSize}
+              size={isMobile ? iconSize : undefined}
+            >
               {item.type === IconType.Custom ? (
                 <CustomEmoji value={item.value} title={item.name} />
               ) : (
@@ -119,10 +187,14 @@ const GridTemplate = (
       height={height}
       data={gridItems}
       columns={itemsPerRow}
-      itemWidth={BUTTON_SIZE}
+      itemWidth={buttonSize}
+      onOverflowChange={onOverflowChange}
     />
   );
-};
+}
+
+const valueOf = (icon: IconNode) =>
+  icon.type === IconType.SVG ? icon.name : icon.value;
 
 const CategoryName = styled(Text)`
   grid-column: 1 / -1;
@@ -136,4 +208,4 @@ const Icon = styled.svg`
   transition-delay: var(--delay);
 `;
 
-export default React.forwardRef(GridTemplate);
+export default GridTemplate;

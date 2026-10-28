@@ -1,10 +1,17 @@
+import cluster from "node:cluster";
 import path from "node:path";
-import type { InferAttributes, InferCreationAttributes } from "sequelize";
+import { DatabaseError, UniqueConstraintError } from "sequelize";
+import type {
+  InferAttributes,
+  InferCreationAttributes,
+  Transaction,
+} from "sequelize";
 import sequelizeStrictAttributes from "sequelize-strict-attributes";
 import type { SequelizeOptions } from "sequelize-typescript";
 import { Sequelize } from "sequelize-typescript";
 import type { MigrationError } from "umzug";
 import { Umzug, SequelizeStorage } from "umzug";
+import { toError } from "@shared/utils/error";
 import env from "@server/env";
 import { ClientClosedRequestError } from "@server/errors";
 import type Model from "@server/models/base/Model";
@@ -39,11 +46,96 @@ function getDatabaseConfig() {
   );
 }
 
+/** Postgres error code for `query_canceled`. */
+const QueryCanceledErrorCode = "57014";
+
+/** Headroom between the statement timeout and the HTTP request timeout. */
+const StatementTimeoutMargin = 500;
+
+/** Sequelize types the query generator as unknown; this narrows to the single
+ * method used to begin a transaction. */
+interface QueryGeneratorWithTransaction {
+  startTransactionQuery(
+    transaction: Transaction & { parent?: Transaction }
+  ): string;
+}
+
 const isSSLDisabled = env.PGSSLMODE === "disable";
 const poolMax = env.DATABASE_CONNECTION_POOL_MAX ?? 5;
 const poolMin = env.DATABASE_CONNECTION_POOL_MIN ?? 0;
 const databaseConfig = env.DATABASE_CONNECTION_POOL_URL || getDatabaseConfig();
 const schema = env.DATABASE_SCHEMA;
+
+const isApiProcess =
+  (env.SERVICES.includes("web") ||
+    env.SERVICES.includes("collaboration") ||
+    env.SERVICES.includes("websockets") ||
+    env.SERVICES.includes("admin")) &&
+  !env.SERVICES.includes("worker") &&
+  !env.SERVICES.includes("cron");
+
+// Request-handling processes get a Postgres `statement_timeout` slightly under
+// the HTTP request timeout, so a single slow query cannot hold a connection
+// past the point at which its response could be delivered, and the cancelation
+// still leaves enough headroom to write an error response before the socket is
+// closed. Applied as `SET LOCAL` inside each transaction so the value is scoped
+// to the transaction.
+const statementTimeout =
+  isApiProcess && cluster.isWorker
+    ? Math.max(
+        env.REQUEST_TIMEOUT - StatementTimeoutMargin,
+        // Fall back to a fraction of the request timeout when it is shorter
+        // than the margin, so the query is always canceled first.
+        Math.round(env.REQUEST_TIMEOUT / 2)
+      )
+    : undefined;
+
+/**
+ * Whether an error was caused by Postgres canceling a query, most commonly
+ * because it exceeded the configured `statement_timeout`.
+ *
+ * @param err the error to inspect.
+ * @returns true if the query was canceled by the database.
+ */
+export function isQueryCanceledError(err: unknown): boolean {
+  return (
+    err instanceof DatabaseError &&
+    !!err.parent &&
+    "code" in err.parent &&
+    err.parent.code === QueryCanceledErrorCode
+  );
+}
+
+/**
+ * Run the given function, retrying it when it fails due to a unique constraint
+ * violation. Useful for operations that choose a unique value based on a prior
+ * read, where a concurrent request may claim the same value first.
+ *
+ * @param fn the function to run, this should include any transaction as a
+ * violation leaves the surrounding transaction unusable.
+ * @param attempts the maximum number of times to run the function.
+ * @returns the result of the function.
+ * @throws the last error if it is not a unique constraint violation, or the
+ * maximum number of attempts has been reached.
+ */
+export async function retryOnUniqueConstraintError<T>(
+  fn: () => Promise<T>,
+  attempts = 3
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!(err instanceof UniqueConstraintError) || attempt >= attempts) {
+        throw err;
+      }
+      Logger.info("database", "Retrying after unique constraint violation", {
+        attempt,
+        fields: err.fields,
+      });
+    }
+  }
+}
 
 export function createDatabaseInstance(
   databaseConfig: string | object,
@@ -105,8 +197,15 @@ export function createDatabaseInstance(
 
     sequelizeStrictAttributes(instance);
 
+    if (statementTimeout) {
+      instance = applyStatementTimeoutToTransactions(
+        instance,
+        Number(statementTimeout)
+      );
+    }
+
     if (env.isTest) {
-      instance = monkeyPatchSequelizeErrorsForJest(instance);
+      instance = monkeyPatchSequelizeErrorsForTests(instance);
     }
 
     // Skip queries when the originating HTTP request socket has been destroyed
@@ -168,13 +267,16 @@ export const checkConnection = async (db: Sequelize) => {
   try {
     await db.authenticate();
   } catch (error) {
-    if (error.message.includes("does not support SSL")) {
+    if (
+      error instanceof Error &&
+      error.message.includes("does not support SSL")
+    ) {
       Logger.fatal(
         "The database does not support SSL connections. Set the `PGSSLMODE` environment variable to `disable` or enable SSL on your database server.",
         error
       );
     } else {
-      Logger.fatal("Failed to connect to database", error);
+      Logger.fatal("Failed to connect to database", toError(error));
     }
   }
 };
@@ -214,30 +316,60 @@ export function createMigrationRunner(
         Logger.info(
           "database",
           params.event === "migrating"
-            ? `Migrating ${params.name}…`
-            : `Migrated ${params.name} in ${params.durationSeconds}s`
+            ? `Migrating ${String(params.name)}…`
+            : `Migrated ${String(params.name)} in ${String(params.durationSeconds)}s`
         ),
       debug: (params) =>
         Logger.debug(
           "database",
           params.event === "migrating"
-            ? `Migrating ${params.name}…`
-            : `Migrated ${params.name} in ${params.durationSeconds}s`
+            ? `Migrating ${String(params.name)}…`
+            : `Migrated ${String(params.name)} in ${String(params.durationSeconds)}s`
         ),
     },
   });
 }
 
 /**
+ * Appends `SET LOCAL statement_timeout` to the statement that begins each
+ * transaction, so that both are sent in a single round trip. Using `SET LOCAL`
+ * scopes the value to the transaction, preventing it from leaking to other
+ * consumers (e.g. background workers) sharing the same underlying connection
+ * via pgbouncer's transaction pooling.
+ *
+ * @param instance the Sequelize instance to modify.
+ * @param timeoutMs the statement timeout in milliseconds.
+ * @returns the modified Sequelize instance.
+ */
+export function applyStatementTimeoutToTransactions(
+  instance: Sequelize,
+  timeoutMs: number
+) {
+  const queryGenerator = instance.getQueryInterface()
+    .queryGenerator as QueryGeneratorWithTransaction;
+  const origStartTransactionQuery =
+    queryGenerator.startTransactionQuery.bind(queryGenerator);
+
+  queryGenerator.startTransactionQuery = (transaction) => {
+    const sql = origStartTransactionQuery(transaction);
+
+    // Savepoints inherit the value set when the outer transaction began.
+    if (transaction.parent) {
+      return sql;
+    }
+    return `${sql} SET LOCAL statement_timeout = ${timeoutMs};`;
+  };
+
+  return instance;
+}
+
+/**
  * Fixed in Sequelize v7, but hasn't been back-ported to Sequelize v6.
  * See https://github.com/sequelize/sequelize/issues/14807#issuecomment-1854398131
  */
-export function monkeyPatchSequelizeErrorsForJest(instance: Sequelize) {
-  if (typeof jest === "undefined") {
-    return instance;
-  }
-
-  const sequelizeVersion = (Sequelize as any).version;
+export function monkeyPatchSequelizeErrorsForTests(instance: Sequelize) {
+  const sequelizeVersion = (Sequelize as unknown as { version: string })
+    .version;
   const major = sequelizeVersion.split(".").map(Number)[0];
 
   if (major >= 7) {
@@ -249,18 +381,17 @@ export function monkeyPatchSequelizeErrorsForJest(instance: Sequelize) {
     );
   }
 
-  const origQueryFunc = instance.query;
-  instance.query = async function query(this: Sequelize, ...args: any[]) {
-    let result;
+  const origQueryFunc = instance.query.bind(instance);
+  instance.query = (async (...args: Parameters<typeof origQueryFunc>) => {
     try {
-      result = await origQueryFunc.apply(this, args as any);
-    } catch (err: any) {
-      // Ensure error appears in Jest output, not swallowed by Sequelize internals
-      Logger.error(err.message, err.parent);
+      return await origQueryFunc(...args);
+    } catch (err) {
+      // Ensure error appears in test output, not swallowed by Sequelize internals
+      const error = err as Error & { parent?: Error };
+      Logger.error(error.message, error.parent ?? error);
       throw err;
     }
-    return result;
-  } as typeof origQueryFunc;
+  }) as typeof instance.query;
 
   return instance;
 }
@@ -269,17 +400,20 @@ export const sequelize = createDatabaseInstance(databaseConfig, models);
 
 /**
  * Read-only database connection for read replicas.
- * Falls back to the main connection if DATABASE_READ_ONLY_URL is not set.
+ * Falls back to the main connection if DATABASE_READ_ONLY_URL is not set, and
+ * in the test environment, where DATABASE_READ_ONLY_URL would not point at
+ * the isolated per-worker test database.
  */
-export const sequelizeReadOnly = env.DATABASE_READ_ONLY_URL
-  ? createDatabaseInstance(
-      env.DATABASE_READ_ONLY_URL,
-      {},
-      {
-        readOnly: true,
-      }
-    )
-  : sequelize;
+export const sequelizeReadOnly =
+  env.DATABASE_READ_ONLY_URL && !env.isTest
+    ? createDatabaseInstance(
+        env.DATABASE_READ_ONLY_URL,
+        {},
+        {
+          readOnly: true,
+        }
+      )
+    : sequelize;
 
 export const migrations = createMigrationRunner(sequelize, [
   "migrations/*.js",

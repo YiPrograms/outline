@@ -1,9 +1,10 @@
-import type Extension from "@shared/editor/lib/Extension";
-import type Mark from "@shared/editor/marks/Mark";
-import type Node from "@shared/editor/nodes/Node";
+import type { AnyExtensionClass } from "@shared/editor/lib/types";
 import BlockMenuExtension from "~/editor/extensions/BlockMenu";
 import ClipboardTextSerializer from "~/editor/extensions/ClipboardTextSerializer";
+import CommentGutterExtension from "~/editor/extensions/CommentGutter";
 import DiagramsExtension from "@shared/editor/extensions/Diagrams";
+import DocumentMenuExtension from "~/editor/extensions/DocumentMenu";
+import DragHandle from "~/editor/extensions/DragHandle";
 import EmojiMenuExtension from "~/editor/extensions/EmojiMenu";
 import FindAndReplaceExtension from "~/editor/extensions/FindAndReplace";
 import HoverPreviewsExtension from "~/editor/extensions/HoverPreviews";
@@ -14,7 +15,7 @@ import PreventTab from "~/editor/extensions/PreventTab";
 import SelectionToolbarExtension from "~/editor/extensions/SelectionToolbar";
 import SmartText from "~/editor/extensions/SmartText";
 
-type Nodes = (typeof Node | typeof Mark | typeof Extension)[];
+type Nodes = AnyExtensionClass[];
 
 export const withUIExtensions = (nodes: Nodes) => [
   ...nodes,
@@ -24,10 +25,13 @@ export const withUIExtensions = (nodes: Nodes) => [
   BlockMenuExtension,
   EmojiMenuExtension,
   MentionMenuExtension,
+  DocumentMenuExtension,
   FindAndReplaceExtension,
   HoverPreviewsExtension,
   SelectionToolbarExtension,
+  CommentGutterExtension,
   DiagramsExtension,
+  DragHandle,
   // Order these default key handlers last
   PreventTab,
   Keys,

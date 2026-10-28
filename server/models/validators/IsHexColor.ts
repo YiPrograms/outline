@@ -1,10 +1,10 @@
-import { isHexColor } from "class-validator";
+import isHexColor from "validator/lib/isHexColor";
 import { addAttributeOptions } from "sequelize-typescript";
 
 /**
  * A decorator that validates that a string is a valid hex color code.
  */
-export default function IsHexColor(target: any, propertyName: string) {
+export default function IsHexColor(target: object, propertyName: string) {
   return addAttributeOptions(target, propertyName, {
     validate: {
       validDomain(value: string) {

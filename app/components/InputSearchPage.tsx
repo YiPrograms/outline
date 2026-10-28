@@ -4,11 +4,14 @@ import * as React from "react";
 import { useTranslation } from "react-i18next";
 import { useHistory } from "react-router-dom";
 import styled, { useTheme } from "styled-components";
-import { isModKey } from "@shared/utils/keyboard";
+import { breakpoint } from "@shared/styles/breakpoint";
+import { s } from "@shared/styles";
+import { metaDisplay, shortcutSeparator } from "@shared/utils/keyboard";
 import useBoolean from "~/hooks/useBoolean";
 import useKeyDown from "~/hooks/useKeyDown";
+import useMobile from "~/hooks/useMobile";
 import { searchPath } from "~/utils/routeHelpers";
-import Input, { Outline } from "./Input";
+import Input from "./Input";
 
 type Props = {
   /** A string representing where the search started, for tracking. */
@@ -42,14 +45,19 @@ function InputSearchPage({
   const theme = useTheme();
   const history = useHistory();
   const { t } = useTranslation();
+  const isMobile = useMobile();
   const [isFocused, setFocused, setUnfocused] = useBoolean(false);
 
-  useKeyDown("f", (ev: KeyboardEvent) => {
-    if (isModKey(ev) && document.activeElement !== inputRef.current) {
-      ev.preventDefault();
-      inputRef.current?.focus();
-    }
-  });
+  useKeyDown(
+    "f",
+    (ev: KeyboardEvent) => {
+      if (document.activeElement !== inputRef.current) {
+        ev.preventDefault();
+        inputRef.current?.focus();
+      }
+    },
+    { metaKey: true }
+  );
 
   const handleKeyDown = React.useCallback(
     (ev: React.KeyboardEvent<HTMLInputElement>) => {
@@ -97,16 +105,38 @@ function InputSearchPage({
       onBlur={setUnfocused}
       margin={0}
       labelHidden
-    />
+    >
+      {!isMobile && (
+        <Shortcut $visible={!isFocused && !value && !collectionId}>
+          {metaDisplay}
+          {shortcutSeparator}K
+        </Shortcut>
+      )}
+    </InputMaxWidth>
   );
 }
 
-const InputMaxWidth = styled(Input)`
-  max-width: 30vw;
+const InputMaxWidth = styled(Input).attrs({ round: true })`
+  max-width: min(calc(30vw + 20px), 100%);
 
-  ${Outline} {
-    border-radius: 16px;
-  }
+  /* On mobile the input grows to fill the header, so add a gap before the
+   * adjacent action button (e.g. "New doc"). */
+  ${breakpoint("mobile", "tablet")`
+    flex: 1;
+    min-width: 0;
+    margin-inline-end: 8px;
+  `}
+`;
+
+const Shortcut = styled.span<{ $visible: boolean }>`
+  flex-shrink: 0;
+  font-size: 13px;
+  font-feature-settings: "cv08", "zero";
+  color: ${s("textTertiary")};
+  padding-inline: 0 10px;
+  pointer-events: none;
+  opacity: ${(props) => (props.$visible ? 1 : 0)};
+  transition: opacity 100ms ease-in-out;
 `;
 
 export default observer(InputSearchPage);

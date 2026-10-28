@@ -8,6 +8,11 @@ import type AuthenticationProvidersStore from "~/stores/AuthenticationProvidersS
 class AuthenticationProvider extends Model {
   static modelName = "AuthenticationProvider";
 
+  constructor(fields: Record<string, unknown>, store: Model["store"]) {
+    super(fields, store);
+    this.initialize(fields);
+  }
+
   displayName: string;
 
   name: string;
@@ -18,6 +23,8 @@ class AuthenticationProvider extends Model {
 
   groupSyncUsesClaim: boolean;
 
+  groupSyncRequiresSetup: boolean;
+
   @observable
   isConnected: boolean;
 
@@ -27,7 +34,7 @@ class AuthenticationProvider extends Model {
 
   @Field
   @observable
-  settings: AuthenticationProviderSettings | undefined;
+  settings: AuthenticationProviderSettings | undefined = undefined;
 
   @computed
   get isActive() {
@@ -37,11 +44,12 @@ class AuthenticationProvider extends Model {
   @AfterDelete
   static afterDelete(model: AuthenticationProvider) {
     // Restore a placeholder record to allow re-connection
-    return (model.store as AuthenticationProvidersStore).add({
-      ...model,
-      isEnabled: false,
-      isConnected: false,
-    });
+    return (model.store as AuthenticationProvidersStore).add(
+      Object.assign({}, model, {
+        isEnabled: false,
+        isConnected: false,
+      })
+    );
   }
 }
 

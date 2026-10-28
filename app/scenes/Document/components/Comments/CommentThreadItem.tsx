@@ -7,7 +7,7 @@ import * as React from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import styled, { css } from "styled-components";
-import breakpoint from "styled-components-breakpoint";
+import { breakpoint } from "@shared/styles/breakpoint";
 import EventBoundary from "@shared/components/EventBoundary";
 import { s, hover } from "@shared/styles";
 import type { ProsemirrorData } from "@shared/types";
@@ -20,14 +20,15 @@ import Flex from "~/components/Flex";
 import NudeButton from "~/components/NudeButton";
 import ReactionList from "~/components/Reactions/ReactionList";
 import ReactionPicker from "~/components/Reactions/ReactionPicker";
+import { ResizingHeightContainer } from "~/components/ResizingHeightContainer";
 import Text from "~/components/Text";
 import Time from "~/components/Time";
 import Tooltip from "~/components/Tooltip";
-import { resolveCommentFactory } from "~/actions/definitions/comments";
+import { resolveCommentActionFactory } from "~/actions/definitions/comments";
 import useBoolean from "~/hooks/useBoolean";
 import useCurrentUser from "~/hooks/useCurrentUser";
 import CommentMenu from "~/menus/CommentMenu";
-import lazyWithRetry from "~/utils/lazyWithRetry";
+import lazyWithRetry from "@shared/utils/lazyWithRetry";
 
 const CommentEditor = lazyWithRetry(() => import("./CommentEditor"));
 import { HighlightedText } from "./HighlightText";
@@ -70,8 +71,6 @@ function useShowTime(
 type Props = {
   /** The comment to render */
   comment: Comment;
-  /** The text direction of the editor */
-  dir?: "rtl" | "ltr";
   /** Whether this is the first comment in the thread */
   firstOfThread?: boolean;
   /** Whether this is the last comment in the thread */
@@ -103,7 +102,6 @@ function CommentThreadItem({
   firstOfAuthor,
   firstOfThread,
   lastOfThread,
-  dir,
   previousCommentCreatedAt,
   canReply,
   onDelete,
@@ -161,7 +159,7 @@ function CommentThreadItem({
         setFocusedCommentId(null);
       }
     },
-    [comment.id, onUpdate]
+    [comment.id, onUpdate, setFocusedCommentId]
   );
 
   const handleDelete = React.useCallback(() => {
@@ -200,7 +198,7 @@ function CommentThreadItem({
   };
 
   return (
-    <Flex gap={8} align="flex-start" reverse={dir === "rtl"}>
+    <Flex gap={8} align="flex-start">
       {firstOfAuthor && (
         <AvatarSpacer>
           <Avatar model={comment.createdBy} size={24} />
@@ -210,12 +208,11 @@ function CommentThreadItem({
         $firstOfThread={firstOfThread}
         $firstOfAuthor={firstOfAuthor}
         $lastOfThread={lastOfThread}
-        $dir={dir}
         $canReply={canReply}
         column
       >
         {(showAuthor || showTime) && (
-          <Meta size="xsmall" type="secondary" dir={dir}>
+          <Meta size="xsmall" type="secondary">
             {showAuthor && <em>{comment.createdBy.name}</em>}
             {showAuthor && showTime && <> &middot; </>}
             {showTime && (
@@ -255,29 +252,31 @@ function CommentThreadItem({
               </ButtonSmall>
             </Flex>
           )}
-          {!!comment.reactions.length && (
-            <ReactionListContainer gap={6} align="center">
-              <ReactionList
-                model={comment}
-                onAddReaction={handleAddReaction}
-                onRemoveReaction={handleRemoveReaction}
-                picker={
-                  !comment.isResolved ? (
-                    <Action
-                      as={ReactionPicker}
-                      onSelect={handleAddReaction}
-                      size={28}
-                      $rounded
-                    />
-                  ) : undefined
-                }
-              />
-            </ReactionListContainer>
-          )}
+          <ResizingHeightContainer hideOverflow>
+            {!!comment.reactions.length && (
+              <ReactionListContainer gap={6} align="center">
+                <ReactionList
+                  model={comment}
+                  onAddReaction={handleAddReaction}
+                  onRemoveReaction={handleRemoveReaction}
+                  picker={
+                    !comment.isResolved ? (
+                      <Action
+                        as={ReactionPicker}
+                        onSelect={handleAddReaction}
+                        size={28}
+                        $rounded
+                      />
+                    ) : undefined
+                  }
+                />
+              </ReactionListContainer>
+            )}
+          </ResizingHeightContainer>
         </Body>
         <EventBoundary>
           {!isEditing && (
-            <Actions gap={4} dir={dir}>
+            <Actions gap={4}>
               {!comment.isResolved && (
                 <>
                   {firstOfThread && (
@@ -318,10 +317,10 @@ const ResolveButton = ({
   const { t } = useTranslation();
 
   return (
-    <Tooltip content={t("Mark as resolved")} placement="top">
+    <Tooltip content={t("Mark as resolved")}>
       <Action
         as={NudeButton}
-        action={resolveCommentFactory({
+        action={resolveCommentActionFactory({
           comment,
           onResolve: () => onUpdate({ resolved: true }),
         })}
@@ -386,14 +385,13 @@ const Action = styled.span<{ $rounded?: boolean }>`
   }
 `;
 
-const Actions = styled(Flex)<{ dir?: "rtl" | "ltr" }>`
+const Actions = styled(Flex)`
   position: absolute;
-  left: ${(props) => (props.dir !== "rtl" ? "auto" : "4px")};
-  right: ${(props) => (props.dir === "rtl" ? "auto" : "4px")};
+  inset-inline-end: 4px;
   top: 4px;
   transition: opacity 100ms ease-in-out;
   background: ${s("backgroundSecondary")};
-  padding-left: 4px;
+  padding-inline-start: 4px;
 
   ${breakpoint("tablet")`
     opacity: 0;
@@ -405,7 +403,7 @@ const Actions = styled(Flex)<{ dir?: "rtl" | "ltr" }>`
 `;
 
 const ReactionListContainer = styled(Flex)`
-  margin-top: 6px;
+  padding-top: 6px;
 `;
 
 const Meta = styled(Text)`
@@ -423,7 +421,6 @@ export const Bubble = styled(Flex)<{
   $lastOfThread?: boolean;
   $canReply?: boolean;
   $focused?: boolean;
-  $dir?: "rtl" | "ltr";
 }>`
   position: relative;
   flex-grow: 1;
@@ -440,16 +437,13 @@ export const Bubble = styled(Flex)<{
   ${({ $lastOfThread, $canReply }) =>
     $lastOfThread &&
     !$canReply &&
-    "border-bottom-left-radius: 8px; border-bottom-right-radius: 8px"};
+    "border-end-start-radius: 8px; border-end-end-radius: 8px"};
 
   ${({ $firstOfThread }) =>
     $firstOfThread &&
-    "border-top-left-radius: 8px; border-top-right-radius: 8px"};
+    "border-start-start-radius: 8px; border-start-end-radius: 8px"};
 
-  margin-left: ${(props) =>
-    props.$firstOfAuthor || props.$dir === "rtl" ? 0 : 32}px;
-  margin-right: ${(props) =>
-    props.$firstOfAuthor || props.$dir !== "rtl" ? 0 : 32}px;
+  margin-inline-start: ${(props) => (props.$firstOfAuthor ? 0 : 32)}px;
 
   p:last-child {
     margin-bottom: 0;

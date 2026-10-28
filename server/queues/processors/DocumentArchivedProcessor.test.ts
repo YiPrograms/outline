@@ -5,7 +5,7 @@ import DocumentArchivedProcessor from "./DocumentArchivedProcessor";
 const ip = "127.0.0.1";
 
 describe("DocumentArchivedProcessor", () => {
-  test("should remove document from actor's starred documents", async () => {
+  it("should remove document from actor's starred documents", async () => {
     const user = await buildUser();
     const document = await buildDocument({
       teamId: user.teamId,
@@ -16,7 +16,7 @@ describe("DocumentArchivedProcessor", () => {
       userId: user.id,
       documentId: document.id,
     });
-    
+
     // Verify the star exists
     expect(
       await Star.count({
@@ -49,14 +49,14 @@ describe("DocumentArchivedProcessor", () => {
     ).toBe(0);
   });
 
-  test("should not remove document from other users' starred documents", async () => {
+  it("should not remove document from other users' starred documents", async () => {
     const actor = await buildUser();
     const otherUser = await buildUser({ teamId: actor.teamId });
     const document = await buildDocument({
       teamId: actor.teamId,
       userId: actor.id,
     });
-    
+
     // Create stars for both users
     await buildStar({
       userId: actor.id,
@@ -95,7 +95,7 @@ describe("DocumentArchivedProcessor", () => {
         },
       })
     ).toBe(0);
-    
+
     // Verify the other user's star still exists
     expect(
       await Star.count({
@@ -107,7 +107,7 @@ describe("DocumentArchivedProcessor", () => {
     ).toBe(1);
   });
 
-  test("should not fail if document is not starred by actor", async () => {
+  it("should not fail if document is not starred by actor", async () => {
     const user = await buildUser();
     const document = await buildDocument({
       teamId: user.teamId,

@@ -18,7 +18,6 @@ import Document from "./Document";
 import Event from "./Event";
 import User from "./User";
 import IdModel from "./base/IdModel";
-import Fix from "./decorators/Fix";
 import { SkipChangeset } from "./decorators/Changeset";
 
 @Scopes(() => ({
@@ -33,12 +32,11 @@ import { SkipChangeset } from "./decorators/Changeset";
   }),
 }))
 @Table({ tableName: "views", modelName: "view" })
-@Fix
 class View extends IdModel<
   InferAttributes<View>,
   Partial<InferCreationAttributes<View>>
 > {
-  @Column
+  @Column(DataType.DATE)
   lastEditingAt: Date | null;
 
   @Default(1)
@@ -102,13 +100,20 @@ class View extends IdModel<
 
   static async findByDocument(
     documentId: string,
-    { includeSuspended }: { includeSuspended?: boolean }
+    {
+      includeSuspended,
+      offset,
+      limit,
+    }: { includeSuspended?: boolean; offset?: number; limit?: number }
   ) {
     return this.findAll({
       where: {
         documentId,
       },
-      order: [["updatedAt", "DESC"]],
+      order: [
+        ["updatedAt", "DESC"],
+        ["id", "ASC"],
+      ],
       include: [
         {
           model: User,
@@ -118,6 +123,8 @@ class View extends IdModel<
             : { where: { suspendedAt: { [Op.is]: null } } }),
         },
       ],
+      offset,
+      limit,
     });
   }
 

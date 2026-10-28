@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { subMinutes } from "date-fns";
 import path from "node:path";
 import type { File } from "formidable";
 import type {
@@ -21,6 +22,7 @@ import {
   BeforeCreate,
   BeforeUpdate,
 } from "sequelize-typescript";
+import { errToString } from "@shared/utils/error";
 import { ValidationError } from "@server/errors";
 import FileStorage from "@server/storage/files";
 import { ValidateKey } from "@server/validation";
@@ -29,13 +31,11 @@ import Team from "./Team";
 import User from "./User";
 import IdModel from "./base/IdModel";
 import { SkipChangeset } from "./decorators/Changeset";
-import Fix from "./decorators/Fix";
 import Length from "./validators/Length";
 import Logger from "@server/logging/Logger";
 import { Buckets } from "./helpers/AttachmentHelper";
 
 @Table({ tableName: "attachments", modelName: "attachment" })
-@Fix
 class Attachment extends IdModel<
   InferAttributes<Attachment>,
   Partial<InferCreationAttributes<Attachment>>
@@ -44,14 +44,14 @@ class Attachment extends IdModel<
     max: 4096,
     msg: "key must be 4096 characters or less",
   })
-  @Column
+  @Column(DataType.STRING)
   key: string;
 
   @Length({
     max: 255,
     msg: "contentType must be 255 characters or less",
   })
-  @Column
+  @Column(DataType.STRING)
   contentType: string;
 
   @IsNumeric
@@ -60,14 +60,14 @@ class Attachment extends IdModel<
 
   @Default("public-read")
   @IsIn([["private", "public-read"]])
-  @Column
+  @Column(DataType.STRING)
   acl: string;
 
-  @Column
+  @Column(DataType.DATE)
   @SkipChangeset
   lastAccessedAt: Date | null;
 
-  @Column
+  @Column(DataType.DATE)
   expiresAt: Date | null;
 
   // getters
@@ -157,6 +157,23 @@ class Attachment extends IdModel<
     });
   }
 
+  /**
+   * Record that the attachment was accessed. The write happens at most once
+   * every five minutes.
+   *
+   * @returns A promise resolving to the attachment.
+   */
+  async updateAccessedAt() {
+    const fiveMinutesAgo = subMinutes(new Date(), 5);
+
+    if (this.lastAccessedAt && this.lastAccessedAt >= fiveMinutesAgo) {
+      return this;
+    }
+
+    this.lastAccessedAt = new Date();
+    return this.save({ silent: true });
+  }
+
   // hooks
 
   @BeforeCreate
@@ -183,7 +200,7 @@ class Attachment extends IdModel<
         {
           id: model.id,
           teamId: model.teamId,
-          message: err.message,
+          message: errToString(err),
         }
       );
     }

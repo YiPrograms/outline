@@ -1,7 +1,9 @@
-import Router from "koa-router";
+import Router from "@koa/router";
 import { Op } from "sequelize";
+import { toError } from "@shared/utils/error";
 import { IntegrationService, IntegrationType } from "@shared/types";
 import { createContext } from "@server/context";
+import { ValidationError } from "@server/errors";
 import apexAuthRedirect from "@server/middlewares/apexAuthRedirect";
 import auth from "@server/middlewares/authentication";
 import { transaction } from "@server/middlewares/transaction";
@@ -10,16 +12,27 @@ import validateWebhook from "@server/middlewares/validateWebhook";
 import { IntegrationAuthentication, Integration } from "@server/models";
 import { authorize } from "@server/policies";
 import type { APIContext } from "@server/types";
+import { safeEqual } from "@server/utils/crypto";
+import { RequestHelper } from "@server/utils/RequestHelper";
+import {
+  generateOAuthStateNonce,
+  verifyOAuthStateNonce,
+} from "@server/utils/oauth";
 import { validateUrlNotPrivate } from "@server/utils/url";
 import { addSeconds } from "date-fns";
 import Logger from "@server/logging/Logger";
-import { GitLabUtils } from "../../shared/GitLabUtils";
+import { GitLabOAuthNonceCookie, GitLabUtils } from "../../shared/GitLabUtils";
 import { GitLab } from "../gitlab";
 import env from "../env";
 import GitLabWebhookTask from "../tasks/GitLabWebhookTask";
-import * as T from "../schema";
+import * as T from "./schema";
 
 const router = new Router();
+
+function getGitLabWebhookToken(ctx: APIContext): string | undefined {
+  const signatureHeader = ctx.request.headers["x-gitlab-token"];
+  return Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
+}
 
 router.post(
   "gitlab.connect",
@@ -111,7 +124,12 @@ router.post(
       }
     }
 
-    const redirectUrl = GitLabUtils.authUrl(user.teamId, url, clientId);
+    const nonce = generateOAuthStateNonce(ctx, GitLabOAuthNonceCookie);
+    const redirectUrl = GitLabUtils.authUrl(
+      { teamId: user.teamId, nonce },
+      url,
+      clientId
+    );
     ctx.body = {
       data: { redirectUrl },
     };
@@ -123,7 +141,7 @@ router.get(
   auth({ optional: true }),
   validate(T.GitLabCallbackSchema),
   apexAuthRedirect<T.GitLabCallbackReq>({
-    getTeamId: (ctx) => ctx.input.query.state,
+    getTeamId: (ctx) => GitLabUtils.parseState(ctx.input.query.state)?.teamId,
     getRedirectPath: (ctx, team) =>
       GitLabUtils.callbackUrl({
         baseUrl: team.url,
@@ -133,7 +151,7 @@ router.get(
   }),
   transaction(),
   async (ctx: APIContext<T.GitLabCallbackReq>) => {
-    const { code, error } = ctx.input.query;
+    const { code, error, state } = ctx.input.query;
     const { user } = ctx.state.auth;
     const { transaction } = ctx.state;
 
@@ -141,6 +159,14 @@ router.get(
       ctx.redirect(GitLabUtils.errorUrl(error));
       return;
     }
+
+    const parsedState = GitLabUtils.parseState(state);
+    if (!parsedState) {
+      throw ValidationError("Invalid state");
+    }
+
+    verifyOAuthStateNonce(ctx, GitLabOAuthNonceCookie, parsedState.nonce);
+    authorize(user, "createIntegration", user.team);
 
     try {
       // Check for a pending IntegrationAuthentication with custom credentials
@@ -267,7 +293,10 @@ router.get(
 
       ctx.redirect(GitLabUtils.url);
     } catch (err) {
-      Logger.error("Encountered error during Gitlab OAuth callback", err);
+      Logger.error(
+        "Encountered error during Gitlab OAuth callback",
+        toError(err)
+      );
       ctx.redirect(GitLabUtils.errorUrl("unauthenticated"));
     }
   }
@@ -286,7 +315,7 @@ router.post(
       // Self-hosted instances store their client secret in the database,
       // use the X-Gitlab-Instance header to find the matching integration.
       if (instanceUrl && instanceUrl !== "https://gitlab.com") {
-        const integration = await Integration.findOne({
+        const integrations = await Integration.findAll({
           where: {
             service: IntegrationService.GitLab,
             settings: { gitlab: { url: instanceUrl } },
@@ -299,29 +328,47 @@ router.post(
             },
           ],
         });
-        if (integration) {
-          return integration.authentication.clientSecret ?? undefined;
+        const token = getGitLabWebhookToken(ctx);
+        const teamIds = new Set<string>();
+        let clientSecret: string | undefined;
+
+        for (const integration of integrations) {
+          const candidateSecret = integration.authentication.clientSecret;
+
+          if (!candidateSecret || !safeEqual(candidateSecret, token)) {
+            continue;
+          }
+
+          clientSecret = candidateSecret;
+          teamIds.add(integration.teamId);
         }
+
+        if (clientSecret) {
+          ctx.state.webhookTeamIds = [...teamIds];
+        }
+
+        return clientSecret;
       }
 
       // Default GitLab.com instance uses the env secret
       return env.GITLAB_CLIENT_SECRET;
     },
-    getSignatureFromHeader: (ctx) => {
-      const { headers } = ctx.request;
-      const signatureHeader = headers["x-gitlab-token"];
-      return Array.isArray(signatureHeader)
-        ? signatureHeader[0]
-        : signatureHeader;
-    },
+    getSignatureFromHeader: getGitLabWebhookToken,
   }),
   async (ctx: APIContext) => {
-    const { headers, body } = ctx.request;
+    const { headers } = ctx.request;
+    const body = RequestHelper.getBodyObject(ctx.request);
+    const teamIds: Array<string | null> = ctx.state.webhookTeamIds ?? [null];
 
-    await new GitLabWebhookTask().schedule({
-      payload: body,
-      headers,
-    });
+    await Promise.all(
+      teamIds.map((teamId) =>
+        new GitLabWebhookTask().schedule({
+          payload: body,
+          headers,
+          teamId,
+        })
+      )
+    );
 
     ctx.status = 202;
   }

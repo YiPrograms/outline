@@ -3,12 +3,13 @@ import { transparentize } from "polished";
 import * as React from "react";
 import styled, { keyframes } from "styled-components";
 import { s, depths } from "@shared/styles";
+import { shortcutSeparator } from "@shared/utils/keyboard";
 import useMobile from "~/hooks/useMobile";
 import { useTooltipContext } from "./TooltipContext";
 
 export type Props = {
   /** The content to display in the tooltip. */
-  content?: React.ReactChild | React.ReactChild[];
+  content?: React.ReactNode;
   /** A keyboard shortcut to display next to the content */
   shortcut?: React.ReactNode;
   /** Whether to show the shortcut on a new line */
@@ -45,24 +46,6 @@ export type Props = {
   children?: React.ReactNode;
   /** Whether to disable the tooltip entirely */
   disabled?: boolean;
-  /** Custom offset for the tooltip */
-  offset?: [number, number];
-  /** Placement prop for backward compatibility with Tippy */
-  placement?:
-    | "top"
-    | "right"
-    | "bottom"
-    | "left"
-    | "top-start"
-    | "top-end"
-    | "right-start"
-    | "right-end"
-    | "bottom-start"
-    | "bottom-end"
-    | "left-start"
-    | "left-end";
-  /** Delay prop for backward compatibility with Tippy */
-  delay?: number | [number, number];
 };
 
 /**
@@ -92,42 +75,10 @@ function Tooltip({
   disableHoverableContent = false,
   children,
   disabled = false,
-  offset,
-  placement,
-  delay,
   ...rest
 }: Props): React.ReactElement | null {
   const isMobile = useMobile();
   const isInProvider = useTooltipContext();
-
-  // Handle backward compatibility with Tippy props
-  let finalSide = side;
-  let finalAlign = align;
-  let finalDelayDuration = delayDuration;
-  let finalSideOffset = sideOffset;
-
-  // Convert placement prop to side/align for backward compatibility
-  if (placement) {
-    const [placementSide, placementAlign] = placement.split("-");
-    finalSide = placementSide as "top" | "right" | "bottom" | "left";
-    if (placementAlign) {
-      finalAlign = placementAlign as "start" | "center" | "end";
-    }
-  }
-
-  // Handle delay prop for backward compatibility
-  if (delay !== undefined) {
-    if (typeof delay === "number") {
-      finalDelayDuration = delay;
-    } else if (Array.isArray(delay)) {
-      finalDelayDuration = delay[0];
-    }
-  }
-
-  // Handle offset prop for backward compatibility
-  if (offset) {
-    finalSideOffset = offset[1] || sideOffset;
-  }
 
   let content = <>{tooltip}</>;
 
@@ -141,13 +92,16 @@ function Tooltip({
         {tooltip}
         {shortcutOnNewline ? <br /> : " "}
         {typeof shortcut === "string" ? (
-          shortcut
-            .split("+")
-            .map((key, i) => (
+          shortcut.split("+").flatMap((key, i, arr) => {
+            const el = (
               <Shortcut key={`${key}${i}`}>
                 {key.length === 1 ? key.toUpperCase() : key}
               </Shortcut>
-            ))
+            );
+            return i < arr.length - 1 && shortcutSeparator
+              ? [el, shortcutSeparator]
+              : [el];
+          })
         ) : (
           <Shortcut>{shortcut}</Shortcut>
         )}
@@ -160,15 +114,15 @@ function Tooltip({
       defaultOpen={defaultOpen}
       open={open}
       onOpenChange={onOpenChange}
-      delayDuration={isInProvider ? undefined : finalDelayDuration}
+      delayDuration={isInProvider ? undefined : delayDuration}
       disableHoverableContent={disableHoverableContent}
     >
       <TooltipPrimitive.Trigger asChild>{children}</TooltipPrimitive.Trigger>
       <TooltipPrimitive.Portal>
         <StyledContent
-          side={finalSide}
-          sideOffset={finalSideOffset}
-          align={finalAlign}
+          side={side}
+          sideOffset={sideOffset}
+          align={align}
           alignOffset={alignOffset}
           avoidCollisions={avoidCollisions}
           collisionBoundary={collisionBoundary}
@@ -189,7 +143,7 @@ function Tooltip({
   // Otherwise, wrap with a provider for standalone usage
   return (
     <TooltipPrimitive.Provider
-      delayDuration={finalDelayDuration}
+      delayDuration={delayDuration}
       skipDelayDuration={skipDelayDuration}
     >
       {tooltipContent}
@@ -250,6 +204,7 @@ const Shortcut = styled.kbd`
   padding: 2px 4px;
   font-size: 12px;
   font-family: ${s("fontFamilyMono")};
+  font-feature-settings: "cv08", "zero";
   line-height: 10px;
   color: ${s("tooltipText")};
   border: 1px solid ${(props) => transparentize(0.75, props.theme.tooltipText)};

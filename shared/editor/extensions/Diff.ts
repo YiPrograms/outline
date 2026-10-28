@@ -1,4 +1,4 @@
-import { observable } from "mobx";
+import { makeObservable, observable } from "mobx";
 import type { Command } from "prosemirror-state";
 import { Plugin, PluginKey } from "prosemirror-state";
 import { Decoration, DecorationSet } from "prosemirror-view";
@@ -13,12 +13,57 @@ import { toggleFoldPluginKey } from "../nodes/ToggleBlock";
 
 const pluginKey = new PluginKey("diffs");
 
-export default class Diff extends Extension {
+/**
+ * Options for the Diff extension.
+ */
+type DiffOptions = {
+  /** The set of changes to render as decorations, or null to disable diff rendering. */
+  changes: readonly ExtendedChange[] | null;
+  /** CSS class applied to inline insertions. */
+  insertionClassName: string;
+  /** CSS class applied to inline deletions. */
+  deletionClassName: string;
+  /** CSS class applied to whole-node insertions. */
+  nodeInsertionClassName: string;
+  /** CSS class applied to whole-node deletions. */
+  nodeDeletionClassName: string;
+  /** CSS class applied to inline modifications. */
+  modificationClassName: string;
+  /** CSS class applied to whole-node modifications. */
+  nodeModificationClassName: string;
+  /** CSS class applied to the change currently focused via navigation. */
+  currentChangeClassName: string;
+};
+
+export default class Diff extends Extension<DiffOptions> {
+  /**
+   * Count the total number of individual changes in a changeset.
+   *
+   * @param changes the set of changes, or null.
+   * @returns the total count of all inserted, deleted, and modified items.
+   */
+  public static countChanges(
+    changes: readonly ExtendedChange[] | null
+  ): number {
+    if (!changes) {
+      return 0;
+    }
+
+    return changes.reduce(
+      (total, change) =>
+        total +
+        change.inserted.length +
+        change.deleted.length +
+        change.modified.length,
+      0
+    );
+  }
+
   get name() {
     return "diff";
   }
 
-  get defaultOptions() {
+  get defaultOptions(): DiffOptions {
     return {
       changes: null,
       insertionClassName: EditorStyleHelper.diffInsertion,
@@ -60,19 +105,7 @@ export default class Diff extends Extension {
    * @returns the total count of all inserted, deleted, and modified items.
    */
   public getTotalChangesCount(): number {
-    const { changes } = this.options as { changes: ExtendedChange[] | null };
-    if (!changes) {
-      return 0;
-    }
-
-    return changes.reduce(
-      (total, change) =>
-        total +
-        change.inserted.length +
-        change.deleted.length +
-        change.modified.length,
-      0
-    );
+    return Diff.countChanges(this.options.changes);
   }
 
   private goToChange(direction: number): Command {
@@ -122,20 +155,25 @@ export default class Diff extends Extension {
         key: pluginKey,
         state: {
           init: (_, state) => this.createDecorations(state.doc),
-          apply: (tr) => this.createDecorations(tr.doc),
+          apply: (tr, prev) => {
+            if (!tr.docChanged && !tr.getMeta(pluginKey)) {
+              return prev;
+            }
+            return this.createDecorations(tr.doc);
+          },
         },
         props: {
           decorations(state) {
             return this.getState(state);
           },
         },
-        // Allow meta transactions to bypass filtering
+        // Block doc-changing transactions to keep the diff immutable, but
+        // allow selection updates and a few cooperating plugins through.
         filterTransaction: (tr) =>
-          tr.getMeta("codeHighlighting") ||
-          tr.getMeta(pluginKey) ||
-          tr.getMeta(toggleFoldPluginKey)
-            ? true
-            : false,
+          !tr.docChanged ||
+          !!tr.getMeta("codeHighlighting") ||
+          !!tr.getMeta(pluginKey) ||
+          !!tr.getMeta(toggleFoldPluginKey),
       }),
     ];
   }
@@ -322,9 +360,17 @@ export default class Diff extends Extension {
           return;
         }
 
-        modification.data.slice.content.forEach((node: Node) => {
-          const nodeSize = node.nodeSize;
-          const end = pos + nodeSize;
+        modification.data.slice.content.forEach(() => {
+          // The slice describes the content before the change, and may cover
+          // more nodes than remain at this position, so the node being
+          // decorated is measured in the document itself.
+          const node =
+            pos <= doc.content.size ? doc.resolve(pos).nodeAfter : null;
+          if (!node) {
+            return;
+          }
+
+          const end = pos + node.nodeSize;
 
           // Check if this specific node should use node decoration
           const useNodeDecoration =
@@ -346,6 +392,11 @@ export default class Diff extends Extension {
     });
 
     return DecorationSet.create(doc, decorations);
+  }
+
+  constructor(options: Partial<DiffOptions> = {}) {
+    super(options);
+    makeObservable(this);
   }
 
   @observable

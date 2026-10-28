@@ -10,12 +10,14 @@ import {
   PopoverContent,
 } from "~/components/primitives/Popover";
 import useMobile from "~/hooks/useMobile";
+import useClickIntent from "~/hooks/useClickIntent";
+import useShareDataLoader from "~/hooks/useShareDataLoader";
 import useStores from "~/hooks/useStores";
 import { preventDefault } from "~/utils/events";
-import lazyWithRetry from "~/utils/lazyWithRetry";
+import lazyWithRetry from "@shared/utils/lazyWithRetry";
 
 const SharePopover = lazyWithRetry(
-  () => import("~/components/Sharing/Document")
+  () => import("~/components/Sharing/Document/SharePopover")
 );
 
 type Props = {
@@ -31,14 +33,33 @@ function ShareButton({ document }: Props) {
   const share = shares.getByDocumentId(document.id);
   const sharedParent = shares.getByDocumentParents(document);
   const domain = share?.domain || sharedParent?.domain;
+  const { preload, loading, reset } = useShareDataLoader({ document });
+
+  const handleOpenChange = useCallback(
+    (isOpen: boolean) => {
+      setOpen(isOpen);
+      if (isOpen) {
+        preload();
+      } else {
+        reset();
+      }
+    },
+    [preload, reset]
+  );
+
+  const handleIntent = useCallback(() => {
+    preload();
+    void SharePopover.preload();
+  }, [preload]);
+  const {
+    ref: intentRef,
+    handleMouseEnter,
+    handleMouseLeave,
+  } = useClickIntent(handleIntent, { predict: true });
 
   const closePopover = useCallback(() => {
-    setOpen(false);
-  }, []);
-
-  const handleMouseEnter = useCallback(() => {
-    void document.share();
-  }, [document]);
+    handleOpenChange(false);
+  }, [handleOpenChange]);
 
   if (isMobile) {
     return null;
@@ -47,9 +68,15 @@ function ShareButton({ document }: Props) {
   const icon = document.isPubliclyShared ? <GlobeIcon /> : undefined;
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger>
-        <Button icon={icon} neutral onMouseEnter={handleMouseEnter}>
+        <Button
+          ref={intentRef}
+          icon={icon}
+          neutral
+          onMouseEnter={handleMouseEnter}
+          onMouseLeave={handleMouseLeave}
+        >
           {t("Share")} {domain && <>&middot; {domain}</>}
         </Button>
       </PopoverTrigger>
@@ -66,6 +93,7 @@ function ShareButton({ document }: Props) {
             document={document}
             onRequestClose={closePopover}
             visible={open}
+            loading={loading}
           />
         </Suspense>
       </PopoverContent>

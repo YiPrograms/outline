@@ -1,3 +1,3 @@
-jest.mock("i18next-http-backend");
+import { vi } from "vitest";
 
-export {};
+vi.mock("i18next-http-backend");

@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 import styled from "styled-components";
 import { s, hover, truncateMultiline } from "@shared/styles";
+import { NotificationEventType } from "@shared/types";
 import type Notification from "~/models/Notification";
 import useStores from "~/hooks/useStores";
 import { Avatar, AvatarSize, AvatarVariant } from "../Avatar";
@@ -12,15 +13,15 @@ import Flex from "../Flex";
 import Text from "../Text";
 import Time from "../Time";
 import { UnreadBadge } from "../UnreadBadge";
-import lazyWithRetry from "~/utils/lazyWithRetry";
+import lazyWithRetry from "@shared/utils/lazyWithRetry";
 import { ContextMenu } from "../Menu/ContextMenu";
-import { createActionWithChildren } from "~/actions";
 import {
-  notificationMarkRead,
-  notificationMarkUnread,
-  notificationArchive,
+  notificationMarkReadActionFactory,
+  notificationMarkUnreadActionFactory,
+  notificationArchiveActionFactory,
 } from "~/actions/definitions/notifications";
-import { NotificationSection } from "~/actions/sections";
+import { useMenuAction } from "~/hooks/useMenuAction";
+import AccessRequestActions from "./AccessRequestActions";
 
 const CommentEditor = lazyWithRetry(
   () => import("~/scenes/Document/components/Comments/CommentEditor")
@@ -37,6 +38,10 @@ function NotificationListItem({ notification, onNavigate }: Props) {
   const collectionId = notification.document?.collectionId;
   const collection = collectionId ? collections.get(collectionId) : undefined;
 
+  const isAccessRequestPending =
+    notification.event === NotificationEventType.RequestDocumentAccess &&
+    notification.accessRequestStatus === "pending";
+
   const handleClick: React.MouseEventHandler<HTMLAnchorElement> = (event) => {
     if (event.altKey) {
       event.preventDefault();
@@ -50,18 +55,18 @@ function NotificationListItem({ notification, onNavigate }: Props) {
     onNavigate();
   };
 
-  const menuAction = React.useMemo(
-    () =>
-      createActionWithChildren({
-        name: ({ t }) => t("Notification options"),
-        section: NotificationSection,
-        children: [
-          notificationMarkRead(notification),
-          notificationMarkUnread(notification),
-          notificationArchive(notification),
-        ],
-      }),
+  const actions = React.useMemo(
+    () => [
+      notificationMarkReadActionFactory(notification),
+      notificationMarkUnreadActionFactory(notification),
+      notificationArchiveActionFactory(notification),
+    ],
     [notification]
+  );
+  const menuAction = useMenuAction(actions);
+  const commentData = React.useMemo(
+    () => toJS(notification.comment?.data),
+    [notification.comment?.data]
   );
 
   return (
@@ -75,16 +80,17 @@ function NotificationListItem({ notification, onNavigate }: Props) {
                 {notification.actor?.name ?? t("Unknown")}
               </Text>{" "}
               {notification.eventText(t)}{" "}
-              <Text weight="bold">{notification.subject}</Text>
+              <Text weight="bold">{notification.subject(t)}</Text>
             </Text>
             <Text type="tertiary" size="xsmall">
               <Time dateTime={notification.createdAt} addSuffix />{" "}
-              {collection && <>&middot; {collection.name}</>}
+              {collection && <>&middot; {collection.displayName}</>}
             </Text>
-            {notification.comment && (
-              <StyledCommentEditor
-                defaultValue={toJS(notification.comment.data)}
-              />
+            {commentData && (
+              <StyledCommentEditor value={commentData} readOnly />
+            )}
+            {isAccessRequestPending && (
+              <AccessRequestActions notification={notification} />
             )}
           </Flex>
           {notification.viewedAt ? null : <UnreadBadge />}
@@ -117,11 +123,12 @@ const StyledAvatar = styled(Avatar).attrs({
 
 const Container = styled(Flex)<{ $unread: boolean }>`
   position: relative;
-  padding: 8px 12px;
-  padding-right: 40px;
+  padding-block: 8px;
+  padding-inline: 12px 40px;
   border-radius: 4px;
 
   ${StyledLink}[data-state=open] &,
+  &:has([data-state="open"]),
   &:${hover},
   &:active {
     background: ${s("listItemHoverBackground")};

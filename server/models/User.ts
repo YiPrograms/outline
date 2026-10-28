@@ -50,23 +50,26 @@ import type { locales } from "@shared/utils/date";
 import { UserValidation } from "@shared/validations";
 import env from "@server/env";
 import DeleteAttachmentTask from "@server/queues/tasks/DeleteAttachmentTask";
+import { LockHelper } from "@server/storage/LockHelper";
+import { afterCommit } from "@server/storage/transaction";
 import type { APIContext } from "@server/types";
 import { VerificationCode } from "@server/utils/VerificationCode";
 import parseAttachmentIds from "@server/utils/parseAttachmentIds";
 import { CacheHelper } from "@server/utils/CacheHelper";
+import { normalizeIp } from "@server/utils/ip";
 import { RedisPrefixHelper } from "@server/utils/RedisPrefixHelper";
 import { ValidationError } from "../errors";
 import Attachment from "./Attachment";
 import AuthenticationProvider from "./AuthenticationProvider";
 import Collection from "./Collection";
 import Group from "./Group";
+import GroupUser from "./GroupUser";
 import Team from "./Team";
 import UserAuthentication from "./UserAuthentication";
 import UserMembership from "./UserMembership";
 import UserPasskey from "./UserPasskey";
 import ParanoidModel from "./base/ParanoidModel";
 import Encrypted from "./decorators/Encrypted";
-import Fix from "./decorators/Fix";
 import IsUrlOrRelativePath from "./validators/IsUrlOrRelativePath";
 import Length from "./validators/Length";
 import NotContainsUrl from "./validators/NotContainsUrl";
@@ -81,6 +84,7 @@ export enum UserFlag {
   Desktop = "desktop",
   DesktopWeb = "desktopWeb",
   MobileWeb = "mobileWeb",
+  MCP = "mcp",
   AvatarUpdated = "avatarUpdated",
 }
 
@@ -130,7 +134,6 @@ export enum UserFlag {
   },
 }))
 @Table({ tableName: "users", modelName: "user" })
-@Fix
 class User extends ParanoidModel<
   InferAttributes<User>,
   Partial<InferCreationAttributes<User>>
@@ -141,7 +144,7 @@ class User extends ParanoidModel<
     max: UserValidation.maxEmailLength,
     msg: `User email must be between 1 and ${UserValidation.maxEmailLength} characters`,
   })
-  @Column
+  @Column(DataType.STRING)
   email: string | null;
 
   @NotContainsUrl
@@ -150,7 +153,7 @@ class User extends ParanoidModel<
     max: UserValidation.maxNameLength,
     msg: `User name must be between 1 and ${UserValidation.maxNameLength} characters`,
   })
-  @Column
+  @Column(DataType.STRING)
   name: string;
 
   @Default(UserRole.Member)
@@ -162,32 +165,44 @@ class User extends ParanoidModel<
   jwtSecret: string;
 
   @IsDate
-  @Column
+  @Column(DataType.DATE)
   @SkipChangeset
   lastActiveAt: Date | null;
 
   @IsIP
-  @Column
   @SkipChangeset
-  lastActiveIp: string | null;
+  @Column(DataType.STRING)
+  get lastActiveIp(): string | null {
+    return this.getDataValue("lastActiveIp");
+  }
+
+  set lastActiveIp(value: string | null) {
+    this.setDataValue("lastActiveIp", normalizeIp(value));
+  }
 
   @IsDate
-  @Column
+  @Column(DataType.DATE)
   @SkipChangeset
   lastSignedInAt: Date | null;
 
   @IsIP
-  @Column
   @SkipChangeset
-  lastSignedInIp: string | null;
+  @Column(DataType.STRING)
+  get lastSignedInIp(): string | null {
+    return this.getDataValue("lastSignedInIp");
+  }
+
+  set lastSignedInIp(value: string | null) {
+    this.setDataValue("lastSignedInIp", normalizeIp(value));
+  }
 
   @IsDate
-  @Column
+  @Column(DataType.DATE)
   @SkipChangeset
   lastSigninEmailSentAt: Date | null;
 
   @IsDate
-  @Column
+  @Column(DataType.DATE)
   suspendedAt: Date | null;
 
   @Column(DataType.JSONB)
@@ -428,7 +443,7 @@ class User extends ParanoidModel<
   };
 
   /**
-   * Returns the value of the givem preference
+   * Returns the value of the given preference
    *
    * @param preference The user preference to retrieve
    * @returns The preference value if set, else the default value.
@@ -469,18 +484,27 @@ class User extends ParanoidModel<
    * Returns the user's active collection ids. This includes collections the user
    * has access to through group memberships.
    *
-   * @param options Additional options to pass to the find
+   * @param options Additional options to pass to the find, set `skipCache` to bypass the cached response
    * @returns An array of collection ids
    */
-  public collectionIds = async (options: FindOptions<Collection> = {}) => {
+  public collectionIds = async (
+    options: FindOptions<Collection> & { skipCache?: boolean } = {}
+  ) => {
+    const { skipCache, ...findOptions } = options;
     const hasOptions =
-      options.transaction || options.paranoid === false || options.lock;
+      findOptions.transaction ||
+      findOptions.paranoid === false ||
+      findOptions.lock;
 
     const fetchCollectionIds = async () => {
       const collectionStubs = await Collection.findAll({
         attributes: ["id"],
         where: {
           teamId: this.teamId,
+          // Only the owner can access a personal collection.
+          ownerId: {
+            [Op.or]: [{ [Op.is]: null }, { [Op.eq]: this.id }],
+          },
           [Op.or]: [
             ...(this.isGuest
               ? []
@@ -532,13 +556,13 @@ class User extends ParanoidModel<
           },
         ],
         paranoid: true,
-        ...options,
+        ...findOptions,
       });
 
       return Array.from(new Set(collectionStubs.map((c) => c.id)));
     };
 
-    if (hasOptions) {
+    if (hasOptions || skipCache) {
       return fetchCollectionIds();
     }
 
@@ -551,23 +575,31 @@ class User extends ParanoidModel<
     );
   };
 
-  updateActiveAt = async (ctx: Context, force = false) => {
-    const { ip } = ctx.request;
+  /**
+   * Updates the lastActiveAt timestamp, at most once every five minutes.
+   *
+   * @param ctx the request context, if any, used to record the IP and client.
+   * @param force whether to update even if the last update was recent.
+   * @returns a promise that resolves with the updated user.
+   */
+  updateActiveAt = async (ctx?: Context, force = false) => {
     const fiveMinutesAgo = subMinutes(new Date(), 5);
 
     // ensure this is updated only every few minutes otherwise
     // we'll be constantly writing to the DB as API requests happen
     if (!this.lastActiveAt || this.lastActiveAt < fiveMinutesAgo || force) {
       this.lastActiveAt = new Date();
-      this.lastActiveIp = ip;
+      if (ctx) {
+        this.lastActiveIp = ctx.request.ip;
+      }
     }
 
     // Track the clients each user is using
-    if (ctx.userAgent?.source.includes("Outline/")) {
+    if (ctx?.userAgent?.source.includes("Outline/")) {
       this.setFlag(UserFlag.Desktop);
-    } else if (ctx.userAgent?.isDesktop) {
+    } else if (ctx?.userAgent?.isDesktop) {
       this.setFlag(UserFlag.DesktopWeb);
-    } else if (ctx.userAgent?.isMobile) {
+    } else if (ctx?.userAgent?.isMobile) {
       this.setFlag(UserFlag.MobileWeb);
     }
 
@@ -606,7 +638,7 @@ class User extends ParanoidModel<
    * @param service The authentication service used to generate the token, if applicable
    * @returns The session token
    */
-  getJwtToken = (expiresAt?: Date, service?: string) =>
+  getSessionToken = (expiresAt?: Date, service?: string) =>
     JWT.sign(
       {
         id: this.id,
@@ -654,8 +686,9 @@ class User extends ParanoidModel<
     );
 
   /**
-   * Returns a temporary token that is only used for logging in from an email
-   * It can only be used to sign in once and has a medium length expiry
+   * Returns a temporary token that is only used for logging in from an email.
+   * It can only be used to sign in once, from the IP address that requested
+   * it, and expires after 10 minutes.
    *
    * @param ctx The request context, used to get the IP address of the request
    * @returns The email signin token
@@ -683,7 +716,7 @@ class User extends ParanoidModel<
     }
 
     const code = VerificationCode.generate();
-    await VerificationCode.store(this.email, code);
+    await VerificationCode.store(this.teamId, this.email, code);
     return code;
   };
 
@@ -729,6 +762,14 @@ class User extends ParanoidModel<
     model: User,
     { transaction }: { transaction: Transaction }
   ) {
+    // Serialize concurrent deletion within the team, otherwise every request
+    // can read the same count and pass the check.
+    await LockHelper.acquire(
+      model.sequelize,
+      `users:${model.teamId}`,
+      transaction
+    );
+
     const usersCount = await this.count({
       where: {
         teamId: model.teamId,
@@ -751,6 +792,14 @@ class User extends ParanoidModel<
     if (model.role !== UserRole.Admin) {
       return;
     }
+
+    // Shares the lock name with the check above, so both counts are taken
+    // against a settled team.
+    await LockHelper.acquire(
+      model.sequelize,
+      `users:${model.teamId}`,
+      transaction
+    );
 
     const otherAdminsCount = await this.count({
       where: {
@@ -806,6 +855,14 @@ class User extends ParanoidModel<
       previousRole === UserRole.Admin &&
       UserRoleHelper.isRoleLower(model.role, UserRole.Admin)
     ) {
+      // Shares the lock name with the deletion checks, so a demotion and a
+      // deletion cannot each count the other account as the remaining admin.
+      await LockHelper.acquire(
+        model.sequelize,
+        `users:${model.teamId}`,
+        options.transaction
+      );
+
       const { count } = await this.findAndCountAll({
         where: {
           teamId: model.teamId,
@@ -850,6 +907,61 @@ class User extends ParanoidModel<
     }
   }
 
+  // When a user's role changes their set of accessible collections may also
+  // change, so invalidate the cached collection ids.
+  @AfterUpdate
+  static async invalidateCollectionIdsAfterRoleChange(
+    model: User,
+    options: InstanceUpdateOptions<InferAttributes<User>>
+  ) {
+    if (!model.changed("role")) {
+      return;
+    }
+
+    await afterCommit(options.transaction, () =>
+      CacheHelper.removeData(
+        RedisPrefixHelper.getUserCollectionIdsKey(model.id)
+      )
+    );
+  }
+
+  // When a user's suspension state changes, invalidate the cached member count
+  // for every group they belong to so the count reflects only active members.
+  @AfterUpdate
+  static async invalidateGroupMemberCount(
+    model: User,
+    options: InstanceUpdateOptions<InferAttributes<User>>
+  ) {
+    if (!model.changed("suspendedAt")) {
+      return;
+    }
+
+    const groupUsers = await GroupUser.findAll({
+      attributes: ["groupId"],
+      where: { userId: model.id },
+      transaction: options.transaction,
+      raw: true,
+    });
+
+    const groupIds = [
+      ...new Set(groupUsers.map((groupUser) => groupUser.groupId)),
+    ];
+
+    if (!groupIds.length) {
+      return;
+    }
+
+    await afterCommit(options.transaction, () =>
+      Promise.all(
+        groupIds.map((groupId) =>
+          CacheHelper.removeData(
+            RedisPrefixHelper.getCounterCacheKey("Group", "members", groupId)
+          )
+        )
+      )
+    );
+  }
+
   @AfterUpdate
   static deletePreviousAvatar = async (model: User) => {
     const previousAvatarUrl = model.previous("avatarUrl");
@@ -876,7 +988,11 @@ class User extends ParanoidModel<
     }
   };
 
-  static findByEmail = async function (ctx: APIContext, email: string) {
+  static findByEmail = async function (
+    this: typeof User,
+    ctx: APIContext,
+    email: string
+  ) {
     return this.findOne({
       where: {
         teamId: ctx.state.auth.user.teamId,
@@ -886,7 +1002,7 @@ class User extends ParanoidModel<
     });
   };
 
-  static getCounts = async function (teamId: string) {
+  static getCounts = async function (this: typeof User, teamId: string) {
     const countSql = `
       SELECT
         COUNT(CASE WHEN "suspendedAt" IS NOT NULL THEN 1 END) as "suspendedCount",
@@ -899,7 +1015,14 @@ class User extends ParanoidModel<
       WHERE "deletedAt" IS NULL
       AND "teamId" = :teamId
     `;
-    const [results] = await this.sequelize.query(countSql, {
+    const [counts] = await this.sequelize!.query<{
+      activeCount: string;
+      adminCount: string;
+      invitedCount: string;
+      suspendedCount: string;
+      viewerCount: string;
+      count: string;
+    }>(countSql, {
       type: QueryTypes.SELECT,
       replacements: {
         teamId,
@@ -907,15 +1030,6 @@ class User extends ParanoidModel<
         roleViewer: UserRole.Viewer,
       },
     });
-
-    const counts: {
-      activeCount: string;
-      adminCount: string;
-      invitedCount: string;
-      suspendedCount: string;
-      viewerCount: string;
-      count: string;
-    } = results;
 
     return {
       active: parseInt(counts.activeCount),

@@ -1,4 +1,4 @@
-import { DocumentIcon } from "outline-icons";
+import { DocumentIcon, QuestionMarkIcon } from "outline-icons";
 import * as React from "react";
 import Icon from "@shared/components/Icon";
 import CollectionIcon from "~/components/Icons/CollectionIcon";
@@ -7,45 +7,70 @@ import useStores from "~/hooks/useStores";
 interface SidebarItem {
   documentId?: string;
   collectionId?: string;
+  groupId?: string;
 }
 
-export function useSidebarLabelAndIcon(
-  { documentId, collectionId }: SidebarItem,
-  defaultIcon?: React.ReactNode
-) {
+/**
+ * Returns the label and icon for a sidebar item that references a document or
+ * collection. The result is memoized so that rows receive equal props between
+ * renders.
+ *
+ * @param item the ids of the document, collection, or group of the item.
+ * @returns the label and icon of the item.
+ */
+export function useSidebarLabelAndIcon({
+  documentId,
+  collectionId,
+  groupId,
+}: SidebarItem) {
   const { collections, documents } = useStores();
-  const icon = defaultIcon ?? <DocumentIcon />;
+  const document = documentId ? documents.get(documentId) : undefined;
+  const collection =
+    !document && collectionId ? collections.get(collectionId) : undefined;
 
-  if (documentId) {
-    const document = documents.get(documentId);
+  const title = document?.displayTitle;
+  const documentIcon = document?.icon;
+  const initial = document?.initial;
+  const color = document?.color;
+  const isDraft = document?.isDraft;
+  const collectionName = collection?.displayName;
+
+  return React.useMemo(() => {
     if (document) {
       return {
-        label: document.titleWithDefault,
-        icon: document.icon ? (
+        label: title ?? "",
+        icon: documentIcon ? (
           <Icon
-            value={document.icon}
-            initial={document.initial}
-            color={document.color ?? undefined}
+            value={documentIcon}
+            initial={initial ?? ""}
+            color={color ?? undefined}
           />
-        ) : (
-          icon
+        ) : groupId ? null : (
+          <DocumentIcon outline={isDraft} />
         ),
       };
     }
-  }
 
-  if (collectionId) {
-    const collection = collections.get(collectionId);
     if (collection) {
       return {
-        label: collection.name,
+        label: collectionName ?? "",
         icon: <CollectionIcon collection={collection} />,
       };
     }
-  }
 
-  return {
-    label: "",
-    icon,
-  };
+    return {
+      label: "",
+      icon: <QuestionMarkIcon />,
+    };
+  }, [
+    document,
+    title,
+    documentIcon,
+    initial,
+    color,
+    isDraft,
+    groupId,
+    collection,
+    collectionName,
+  ]);
 }

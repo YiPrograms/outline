@@ -1,6 +1,8 @@
 import { useCallback, useRef } from "react";
 import { getCookie, removeCookie, setCookie } from "tiny-cookie";
-import usePersistedState, { setPersistedState } from "~/hooks/usePersistedState";
+import usePersistedState, {
+  setPersistedState,
+} from "~/hooks/usePersistedState";
 import Logger from "~/utils/Logger";
 import history from "~/utils/history";
 import { isAllowedLoginRedirect } from "~/utils/urls";
@@ -38,10 +40,13 @@ export function useLastVisitedPath(): [string, (path: string) => void] {
  * @param currentPath The current path to track.
  */
 export function useTrackLastVisitedPath(currentPath: string): void {
-  const prevPathRef = useRef<string>();
-  
+  const prevPathRef = useRef<string | undefined>(undefined);
+
   // Update localStorage directly if path has changed
-  if (prevPathRef.current !== currentPath && isAllowedLoginRedirect(currentPath)) {
+  if (
+    prevPathRef.current !== currentPath &&
+    isAllowedLoginRedirect(currentPath)
+  ) {
     prevPathRef.current = currentPath;
     setPersistedState("lastVisitedPath", currentPath);
   }

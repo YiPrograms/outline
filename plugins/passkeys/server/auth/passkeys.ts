@@ -6,18 +6,20 @@ import {
 } from "@simplewebauthn/server";
 import { isoBase64URL } from "@simplewebauthn/server/helpers";
 import type { AuthenticatorTransportFuture } from "@simplewebauthn/server";
-import Router from "koa-router";
+import Router from "@koa/router";
 import { randomBytes } from "node:crypto";
+import { toError } from "@shared/utils/error";
 import { User, UserPasskey, Team } from "@server/models";
 import auth from "@server/middlewares/authentication";
 import validate from "@server/middlewares/validate";
 import env from "@server/env";
 import { AuthorizationError, ValidationError } from "@server/errors";
 import type { APIContext } from "@server/types";
+import { AuthenticationType } from "@server/types";
 import Logger from "@server/logging/Logger";
 import Redis from "@server/storage/redis";
 import { signIn } from "@server/utils/authentication";
-import { generatePasskeyName } from "@shared/utils/passkeys";
+import { generatePasskeyName, PasskeyBrand } from "@shared/utils/passkeys";
 import * as T from "./schema";
 import { Client } from "@shared/types";
 import { Minute } from "@shared/utils/time";
@@ -88,19 +90,40 @@ const getRegistrationChallengeKey = (userId: string): string =>
 const getAuthenticationChallengeKey = (challengeId: string): string =>
   `passkey:auth-challenge:${challengeId}`;
 
+/**
+ * Returns true if a user may only register one passkey from the authenticator
+ * with the given AAGUID. The Chromium Touch ID authenticator, which is also used
+ * by the desktop app, reports the same AAGUID on every device, so it is excluded.
+ *
+ * @param aaguid - the authenticator AAGUID from the registration response.
+ * @returns true if a second passkey from the authenticator should be rejected.
+ */
+export const isUniqueAuthenticator = (aaguid: string | undefined): boolean =>
+  !!aaguid &&
+  aaguid !== "00000000-0000-0000-0000-000000000000" &&
+  aaguid !== PasskeyBrand.ChromiumBrowser;
+
 router.post(
   "passkeys.generateRegistrationOptions",
-  auth(),
+  auth({ type: AuthenticationType.APP }),
   async (ctx: APIContext) => {
     const { user } = ctx.state.auth;
     authorize(user, "createUserPasskey", user.team);
+
+    // Fetch existing passkeys to exclude them from registration
+    const existingPasskeys = await UserPasskey.findAll({
+      where: { userId: user.id },
+    });
 
     const options = await generateRegistrationOptions({
       rpName,
       rpID: getRpID(ctx),
       userID: isoBase64URL.toBuffer(user.id),
       userName: user.email || user.name,
-      // Don't exclude credentials, so we can detect if one is already registered (optional)
+      excludeCredentials: existingPasskeys.map((pk) => ({
+        id: pk.credentialId,
+        transports: pk.transports as AuthenticatorTransportFuture[],
+      })),
       authenticatorSelection: {
         residentKey: "preferred",
         userVerification: "preferred",
@@ -121,7 +144,7 @@ router.post(
 
 router.post(
   "passkeys.verifyRegistration",
-  auth(),
+  auth({ type: AuthenticationType.APP }),
   validate(T.PasskeysVerifyRegistrationSchema),
   async (ctx: APIContext<T.PasskeysVerifyRegistrationReq>) => {
     const { user } = ctx.state.auth;
@@ -146,9 +169,12 @@ router.post(
         expectedChallenge,
         expectedOrigin: getExpectedOrigin(ctx),
         expectedRPID: getRpID(ctx),
+        // Match the "preferred" policy in registration options; some
+        // authenticators legitimately skip user verification.
+        requireUserVerification: false,
       });
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
+      const err = toError(error);
       Logger.error("passkeys: Registration verification failed", err);
       throw ValidationError(err.message);
     }
@@ -166,7 +192,7 @@ router.post(
       const userAgent = ctx.request.get("user-agent");
       const transports = body.response.transports || [];
 
-      // Check if already exists
+      // Check if already exists by credential ID
       const existing = await UserPasskey.findOne({
         where: { credentialId: credentialIdBase64 },
       });
@@ -183,6 +209,17 @@ router.post(
           aaguid,
         });
       } else {
+        // Check if user already has a passkey from the same authenticator
+        if (isUniqueAuthenticator(aaguid)) {
+          const duplicateDevice = await UserPasskey.findOne({
+            where: { userId: user.id, aaguid },
+          });
+
+          if (duplicateDevice) {
+            throw ValidationError("You already have a passkey on this device");
+          }
+        }
+
         await UserPasskey.createWithCtx(ctx, {
           userId: user.id,
           credentialId: credentialIdBase64,
@@ -203,6 +240,31 @@ router.post(
     }
   }
 );
+
+/**
+ * Resolves the login screen redirect for the desktop passkey entrypoint,
+ * normalizing an untrusted client query parameter to a known value.
+ *
+ * @param client - the raw client value from the request query.
+ * @returns the relative path to redirect the browser to.
+ */
+export const getPasskeyLoginRedirect = (
+  client: string | string[] | undefined
+): string => {
+  const normalized = client === Client.Desktop ? Client.Desktop : Client.Web;
+  return `/?method=passkey&client=${normalized}`;
+};
+
+/**
+ * Entry point for passkey login from the desktop app. The WebAuthn ceremony
+ * cannot run inside Electron's Chromium, so the desktop client opens this URL
+ * in the system browser. We forward to the login screen, which auto-starts the
+ * ceremony and returns the authenticated session via the outline:// deep link,
+ * mirroring the existing SSO desktop flow.
+ */
+router.get("passkey", (ctx: APIContext) => {
+  ctx.redirect(getPasskeyLoginRedirect(ctx.query.client));
+});
 
 router.post(
   "passkeys.generateAuthenticationOptions",
@@ -284,16 +346,21 @@ router.post(
           counter: passkey.counter,
           transports: passkey.transports as AuthenticatorTransportFuture[],
         },
+        // Match the "preferred" policy in authentication options; some
+        // authenticators legitimately skip user verification.
+        requireUserVerification: false,
       });
     } catch (err) {
-      Logger.error("passkeys: Authentication verification failed", err);
+      Logger.error(
+        "passkeys: Authentication verification failed",
+        toError(err)
+      );
       throw ValidationError("Passkey authentication failed. Please try again.");
     }
 
     const { verified, authenticationInfo } = verification;
 
     if (verified && authenticationInfo) {
-      // Update counter
       passkey.counter = authenticationInfo.newCounter;
       passkey.lastActiveAt = new Date();
       await passkey.save({ silent: true });

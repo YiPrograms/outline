@@ -22,6 +22,7 @@ import useCurrentUser from "~/hooks/useCurrentUser";
 import usePolicy from "~/hooks/usePolicy";
 import useStores from "~/hooks/useStores";
 import UserDelete from "../UserDelete";
+import { AutoLaunchSetting } from "./components/AutoLaunchSetting";
 import SettingRow from "./components/SettingRow";
 
 function Preferences() {
@@ -66,6 +67,24 @@ function Preferences() {
   const handleCodeBlockLineNumbersChange = React.useCallback(
     async (checked: boolean) => {
       user.setPreference(UserPreference.CodeBlockLineNumers, checked);
+      await user.save();
+      toast.success(t("Preferences saved"));
+    },
+    [user, t]
+  );
+
+  const handleCommentsInGutterChange = React.useCallback(
+    async (checked: boolean) => {
+      user.setPreference(UserPreference.CommentsInGutter, checked);
+      await user.save();
+      toast.success(t("Preferences saved"));
+    },
+    [user, t]
+  );
+
+  const handleShowDocumentStatsChange = React.useCallback(
+    async (checked: boolean) => {
+      user.setPreference(UserPreference.ShowDocumentStats, checked);
       await user.save();
       toast.success(t("Preferences saved"));
     },
@@ -141,7 +160,7 @@ function Preferences() {
   );
 
   const handleThemeChange = React.useCallback(
-    (theme) => {
+    (theme: string) => {
       ui.setTheme(theme as Theme);
       toast.success(t("Preferences saved"));
     },
@@ -162,7 +181,7 @@ function Preferences() {
         <Trans>Manage settings that affect your personal experience.</Trans>
       </Text>
 
-      <Heading as="h2">{t("Display")}</Heading>
+      <Heading as="h2">{t("Appearance")}</Heading>
       <SettingRow
         label={t("Language")}
         name="language"
@@ -170,7 +189,7 @@ function Preferences() {
           <>
             <Trans>
               Choose the interface language. Community translations are accepted
-              though our{" "}
+              through our{" "}
               <a
                 href="https://translate.getoutline.com"
                 target="_blank"
@@ -188,20 +207,20 @@ function Preferences() {
           value={user.language}
           onChange={handleLanguageChange}
           label={t("Language")}
-          hideLabel
+          labelHidden
         />
       </SettingRow>
       <SettingRow
         name="theme"
-        label={t("Appearance")}
+        label={t("Theme")}
         description={t("Choose your preferred interface color scheme.")}
       >
         <InputSelect
           options={themeOptions}
           value={ui.theme}
           onChange={handleThemeChange}
-          label={t("Appearance")}
-          hideLabel
+          label={t("Theme")}
+          labelHidden
         />
       </SettingRow>
       <SettingRow
@@ -222,13 +241,41 @@ function Preferences() {
         name={UserPreference.CodeBlockLineNumers}
         label={t("Show line numbers")}
         description={t("Show line numbers on code blocks in documents.")}
-        border={false}
       >
         <Switch
           id={UserPreference.CodeBlockLineNumers}
           name={UserPreference.CodeBlockLineNumers}
           checked={user.getPreference(UserPreference.CodeBlockLineNumers)}
           onChange={handleCodeBlockLineNumbersChange}
+        />
+      </SettingRow>
+      <SettingRow
+        name={UserPreference.CommentsInGutter}
+        label={t("Show comment marker")}
+        description={t(
+          "Display a marker beside lines in the editor that contain comments."
+        )}
+      >
+        <Switch
+          id={UserPreference.CommentsInGutter}
+          name={UserPreference.CommentsInGutter}
+          checked={user.getPreference(UserPreference.CommentsInGutter)}
+          onChange={handleCommentsInGutterChange}
+        />
+      </SettingRow>
+      <SettingRow
+        name={UserPreference.ShowDocumentStats}
+        label={t("Show editing stats")}
+        description={t(
+          "Display live word, character, and paragraph counts while editing."
+        )}
+        border={false}
+      >
+        <Switch
+          id={UserPreference.ShowDocumentStats}
+          name={UserPreference.ShowDocumentStats}
+          checked={user.getPreference(UserPreference.ShowDocumentStats)}
+          onChange={handleShowDocumentStatsChange}
         />
       </SettingRow>
 
@@ -256,7 +303,7 @@ function Preferences() {
         name={UserPreference.RememberLastPath}
         label={t("Remember previous location")}
         description={t(
-          "Automatically return to the document you were last viewing when the app is re-opened."
+          "Automatically return to the document you were last viewing when the app is reopened."
         )}
       >
         <Switch
@@ -280,6 +327,7 @@ function Preferences() {
           onChange={handleEnableSmartTextChange}
         />
       </SettingRow>
+      <AutoLaunchSetting />
       <SettingRow
         border={false}
         name={UserPreference.NotificationBadge}
@@ -293,7 +341,7 @@ function Preferences() {
           value={user.getPreference(UserPreference.NotificationBadge)}
           onChange={handleNotificationBadgeChange}
           label={t("Notification badge")}
-          hideLabel
+          labelHidden
         />
       </SettingRow>
 
@@ -304,7 +352,7 @@ function Preferences() {
             name="delete"
             label={t("Delete account")}
             description={t(
-              "You may delete your account at any time, note that this is unrecoverable"
+              "You may delete your account at any time. Note that this cannot be undone."
             )}
           >
             <span>

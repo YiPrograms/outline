@@ -1,9 +1,19 @@
-/* oxlint-disable @typescript-eslint/ban-ts-comment */
 // @ts-nocheck
 // https://raw.githubusercontent.com/ProseMirror/prosemirror-markdown/master/src/to_markdown.js
 // forked for table support
 
-type Options = { tightLists?: boolean; softBreak?: boolean };
+/** Options that control how a ProseMirror document is serialized to Markdown. */
+type Options = {
+  /** Whether list items are rendered without blank lines between them. */
+  tightLists?: boolean;
+  /**
+   * Whether to emit portable, standard CommonMark intended to leave Outline,
+   * such as when copying to the clipboard or exporting. When false the
+   * serializer uses Outline's internal escaped representation, which round-trips
+   * losslessly through its own parser but is not standard Markdown.
+   */
+  commonMark?: boolean;
+};
 
 // ::- A specification for serializing a ProseMirror document as
 // Markdown/CommonMark text.
@@ -57,6 +67,34 @@ export class MarkdownSerializer {
     state.renderContent(content);
     return state.out;
   }
+
+  // Serialize the content and return both the markdown string and a
+  // block-level position map that records the ProseMirror position range
+  // and markdown character range for each top-level child node.
+  serializeWithPositions(
+    content,
+    options?: Options
+  ): { markdown: string; blockMap: BlockMapEntry[] } {
+    const state = new MarkdownSerializerState(this.nodes, this.marks, options);
+    state.blockMap = [];
+    state.renderContent(content);
+    return { markdown: state.out, blockMap: state.blockMap };
+  }
+}
+
+// Tracks whether we have already warned about direct assignment to `out`,
+// so a hot loop cannot flood the console.
+let warnedDirectOutAssignment = false;
+
+export interface BlockMapEntry {
+  /** Start position in the ProseMirror document (offset within parent content). */
+  pmFrom: number;
+  /** End position in the ProseMirror document. */
+  pmTo: number;
+  /** Start character offset in the serialized markdown string. */
+  mdFrom: number;
+  /** End character offset in the serialized markdown string. */
+  mdTo: number;
 }
 
 // ::- This is an object used to track state and expose
@@ -68,13 +106,36 @@ export class MarkdownSerializerState {
   inTightList = false;
   closed = false;
   delim = "";
-  out = "";
+  _out = "";
+  lastChar = "";
   options: Options;
+  blockMap = null;
+
+  // The serialized output so far. Use `append` to add to it — direct
+  // assignment still works but reads the last character back out of the
+  // string, which forces V8 to flatten the internal rope and is slow when
+  // done repeatedly on large documents.
+  get out() {
+    return this._out;
+  }
+
+  set out(value) {
+    if (!warnedDirectOutAssignment) {
+      warnedDirectOutAssignment = true;
+      // oxlint-disable-next-line no-console
+      console.warn(
+        "MarkdownSerializerState: assigning `out` directly is slow on large documents, use append() instead."
+      );
+    }
+    this._out = value;
+    this.lastChar = value === "" ? "" : value.charAt(value.length - 1);
+  }
 
   constructor(nodes, marks, options) {
     this.nodes = nodes;
     this.marks = marks;
-    this.delim = this.out = "";
+    this.delim = this._out = "";
+    this.lastChar = "";
     this.closed = false;
     this.inTightList = false;
     this.inTable = false;
@@ -90,10 +151,21 @@ export class MarkdownSerializerState {
     }
   }
 
+  // :: (string)
+  // Append a string to the output, tracking `lastChar` without reading
+  // characters back out of `out` — that would force V8 to flatten the
+  // internal rope, which is quadratic on large documents.
+  append(content) {
+    if (content) {
+      this._out += content;
+      this.lastChar = content.charAt(content.length - 1);
+    }
+  }
+
   flushClose(size) {
     if (this.closed) {
       if (!this.atBlank()) {
-        this.out += "\n";
+        this.append("\n");
       }
       if (size === null || size === undefined) {
         size = 2;
@@ -105,7 +177,7 @@ export class MarkdownSerializerState {
           delimMin = delimMin.slice(0, delimMin.length - trim[0].length);
         }
         for (let i = 1; i < size; i++) {
-          this.out += delimMin + "\n";
+          this.append(delimMin + "\n");
         }
       }
       this.closed = false;
@@ -127,14 +199,14 @@ export class MarkdownSerializerState {
   }
 
   atBlank() {
-    return /(^|\n)$/.test(this.out);
+    return this.lastChar === "" || this.lastChar === "\n";
   }
 
   // :: ()
   // Ensure the current content ends with a newline.
   ensureNewLine() {
     if (!this.atBlank()) {
-      this.out += "\n";
+      this.append("\n");
     }
   }
 
@@ -145,10 +217,10 @@ export class MarkdownSerializerState {
   write(content) {
     this.flushClose();
     if (this.delim && this.atBlank()) {
-      this.out += this.delim;
+      this.append(this.delim);
     }
     if (content) {
-      this.out += content;
+      this.append(content);
     }
   }
 
@@ -164,11 +236,17 @@ export class MarkdownSerializerState {
   text(text, escape) {
     const lines = text.split("\n");
     for (let i = 0; i < lines.length; i++) {
-      const startOfLine = this.atBlank() || this.closed;
+      // A <br> in a table cell becomes a new line when the cell is parsed.
+      const startOfLine =
+        this.atBlank() ||
+        this.closed ||
+        (this.inTable && this.out.endsWith("<br>"));
       this.write();
-      this.out += escape !== false ? this.esc(lines[i], startOfLine) : lines[i];
+      this.append(
+        escape !== false ? this.esc(lines[i], startOfLine) : lines[i]
+      );
       if (i !== lines.length - 1) {
-        this.out += "\n";
+        this.append("\n");
       }
     }
   }
@@ -185,7 +263,26 @@ export class MarkdownSerializerState {
   // :: (Node)
   // Render the contents of `parent` as block nodes.
   renderContent(parent) {
-    parent.forEach((node, _, i) => this.render(node, parent, i));
+    parent.forEach((node, offset, i) => {
+      const trackingMap = this.blockMap;
+      const mdFrom = trackingMap ? this.out.length : 0;
+      // Suppress tracking during render so that nested renderContent calls
+      // (e.g. inside list items, blockquotes) don't push entries with
+      // parent-relative positions into the top-level map.
+      if (trackingMap) {
+        this.blockMap = null;
+      }
+      this.render(node, parent, i);
+      if (trackingMap) {
+        this.blockMap = trackingMap;
+        trackingMap.push({
+          pmFrom: offset,
+          pmTo: offset + node.nodeSize,
+          mdFrom,
+          mdTo: this.out.length,
+        });
+      }
+    });
   }
 
   // :: (Node)
@@ -225,7 +322,6 @@ export class MarkdownSerializerState {
           return info && info.expelEnclosingWhitespace;
         })
       ) {
-        // oxlint-disable-next-line @typescript-eslint/no-unused-vars, no-unused-vars
         const [, lead, inner, trail] = /^(\s*)(.*?)(\s*)$/m.exec(node.text);
         leading += lead;
         trailing = trail;
@@ -334,9 +430,9 @@ export class MarkdownSerializerState {
     if (this.inTable) {
       node.forEach((child, _, i) => {
         if (i > 0) {
-          this.out += " <br> ";
+          this.append(" <br> ");
         }
-        this.out += firstDelim(i).trim() + " ";
+        this.append(firstDelim(i).trim() + " ");
         this.render(child, node, i);
       });
       return;
@@ -369,6 +465,11 @@ export class MarkdownSerializerState {
   }
 
   renderTable(node) {
+    // A table with no rows is not valid Markdown and has nothing to serialize.
+    if (node.childCount === 0) {
+      return;
+    }
+
     this.flushClose(1);
 
     const prevTable = this.inTable;
@@ -383,16 +484,31 @@ export class MarkdownSerializerState {
     });
 
     // Ensure there is an empty newline above all tables
-    this.out += "\n";
+    this.write();
+    this.append("\n");
 
-    // Render rows
     node.forEach((row, _, i) => {
+      this.write();
       row.forEach((cell, _, j) => {
-        this.out += j === 0 ? "| " : " | ";
+        this.append(j === 0 ? "| " : " | ");
 
-        const startPos = this.out.length;
+        // A table row is a single line of Markdown, so render the cell into an
+        // isolated buffer and flatten any newlines its block content (notices,
+        // code fences, blockquotes, …) produced into <br>.
+        const cellState = new MarkdownSerializerState(
+          this.nodes,
+          this.marks,
+          this.options
+        );
+        cellState.inTable = true;
+        cellState.inList = this.inList;
+        cellState.inTightList = this.inTightList;
 
-        cell.forEach((cellNode) => {
+        cell.forEach((cellNode, _, index) => {
+          if (index > 0) {
+            cellState.append("\n");
+          }
+
           if (
             !(
               cellNode.textContent === "" &&
@@ -400,34 +516,39 @@ export class MarkdownSerializerState {
               cellNode.type.name === "paragraph"
             )
           ) {
-            this.closed = false;
-            this.render(cellNode, row, j);
+            cellState.closed = false;
+            cellState.render(cellNode, row, j);
           }
         });
 
+        const content = cellState.out
+          .replace(/^\n+|\n+$/g, "")
+          .replace(/\n/g, "<br>");
+        this.append(content);
+
         // Pad to column width
-        const contentLength = this.out.length - startPos;
-        const padding = Math.max(0, columnWidths[j] - contentLength);
-        this.out += " ".repeat(padding);
+        const padding = Math.max(0, columnWidths[j] - content.length);
+        this.append(" ".repeat(padding));
       });
 
-      this.out += " |\n";
+      this.append(" |\n");
 
       // Header separator after first row
       if (i === 0) {
+        this.write();
         headerRow.forEach((cell, _, j) => {
           const width = columnWidths[j];
           if (cell.attrs.alignment === "center") {
-            this.out += "|:" + "-".repeat(width) + ":";
+            this.append("|:" + "-".repeat(width) + ":");
           } else if (cell.attrs.alignment === "left") {
-            this.out += "|:" + "-".repeat(width + 1);
+            this.append("|:" + "-".repeat(width + 1));
           } else if (cell.attrs.alignment === "right") {
-            this.out += "|" + "-".repeat(width + 1) + ":";
+            this.append("|" + "-".repeat(width + 1) + ":");
           } else {
-            this.out += "|" + "-".repeat(width + 2);
+            this.append("|" + "-".repeat(width + 2));
           }
         });
-        this.out += "|\n";
+        this.append("|\n");
       }
     });
 
@@ -439,9 +560,15 @@ export class MarkdownSerializerState {
   // content. If `startOfLine` is true, also escape characters that
   // has special meaning only at the start of the line.
   esc(str = "", startOfLine) {
-    str = str.replace(/[`*\\~[\]]/g, "\\$&");
+    str = str.replace(/[`*\\~]/g, "\\$&");
+    // Only escape an opening square bracket when the same line later contains a
+    // `](`, meaning it could otherwise be parsed as an inline link or image
+    str = str.replace(/\[(?=[^\n]*\]\()/g, "\\$&");
     if (startOfLine) {
-      str = str.replace(/^[:#\-*+]/, "\\$&").replace(/^(\d+)\./, "$1\\.");
+      str = str
+        .replace(/^[:#\-*+]/, "\\$&")
+        .replace(/^(\d+)\.(?=\s|$)/, "$1\\.")
+        .replace(/^([a-z])\.(?=\s)/i, "$1\\.");
     }
 
     if (this.inTable) {

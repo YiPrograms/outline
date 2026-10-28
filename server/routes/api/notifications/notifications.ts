@@ -1,8 +1,5 @@
-import Router from "koa-router";
-import isEmpty from "lodash/isEmpty";
-import isNil from "lodash/isNil";
-import isNull from "lodash/isNull";
-import isUndefined from "lodash/isUndefined";
+import Router from "@koa/router";
+import { isEmpty, isNil, isNull, isUndefined } from "es-toolkit/compat";
 import type { WhereOptions } from "sequelize";
 import { Op } from "sequelize";
 import type { NotificationEventType } from "@shared/types";
@@ -28,9 +25,13 @@ const pixel = Buffer.from(
   "base64"
 );
 
-const handleUnsubscribe = async (
-  ctx: APIContext<T.NotificationsUnsubscribeReq>
-) => {
+/**
+ * Turns off the event type for the user in the request, if the token is valid.
+ *
+ * @param ctx The request context.
+ * @returns The updated user, or undefined if the token is not valid.
+ */
+const unsubscribe = async (ctx: APIContext<T.NotificationsUnsubscribeReq>) => {
   const { transaction } = ctx.state;
   const eventType = (ctx.input.body.eventType ??
     ctx.input.query.eventType) as NotificationEventType;
@@ -42,8 +43,7 @@ const handleUnsubscribe = async (
     eventType
   );
 
-  if (unsubscribeToken !== token) {
-    ctx.redirect(`${env.URL}?notice=invalid-auth`);
+  if (!safeEqual(unsubscribeToken, token)) {
     return;
   }
 
@@ -55,7 +55,7 @@ const handleUnsubscribe = async (
 
   user.setNotificationEventType(eventType, false);
   await user.save({ transaction });
-  ctx.redirect(`${user.team.url}/settings/notifications?success`);
+  return user;
 };
 
 router.get(
@@ -71,15 +71,31 @@ router.get(
       return ctx.redirectOnClient(ctx.request.href + "&follow=true");
     }
 
-    return handleUnsubscribe(ctx);
+    const user = await unsubscribe(ctx);
+    if (!user) {
+      ctx.redirect(`${env.URL}?notice=invalid-auth`);
+      return;
+    }
+
+    ctx.redirect(`${user.team.url}/settings/notifications?success`);
   }
 );
 
+// Supports RFC 8058 one-click unsubscribe from the List-Unsubscribe header.
 router.post(
   "notifications.unsubscribe",
   validate(T.NotificationsUnsubscribeSchema),
   transaction(),
-  handleUnsubscribe
+  async (ctx: APIContext<T.NotificationsUnsubscribeReq>) => {
+    const user = await unsubscribe(ctx);
+    if (!user) {
+      throw AuthenticationError("Invalid unsubscribe token");
+    }
+
+    ctx.body = {
+      success: true,
+    };
+  }
 );
 
 router.post(
@@ -116,10 +132,10 @@ router.post(
         offset: ctx.state.pagination.offset,
         limit: ctx.state.pagination.limit,
       }),
-      Notification.count({
+      Notification.unscoped().count({
         where,
       }),
-      Notification.count({
+      Notification.unscoped().count({
         where: {
           ...where,
           viewedAt: {
@@ -202,12 +218,7 @@ router.post(
     });
     authorize(user, "update", notification);
 
-    if (!isUndefined(viewedAt)) {
-      notification.viewedAt = viewedAt;
-    }
-    if (!isUndefined(archivedAt)) {
-      notification.archivedAt = archivedAt;
-    }
+    notification.fill({ viewedAt, archivedAt });
     await notification.saveWithCtx(ctx);
 
     ctx.body = {

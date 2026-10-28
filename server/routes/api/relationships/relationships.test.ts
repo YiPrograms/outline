@@ -55,11 +55,7 @@ describe("#relationships.info", () => {
   });
 
   it("should fail with status 400 bad request when id is not supplied", async () => {
-    const res = await server.post("/api/relationships.info", {
-      body: {
-        token: user.getJwtToken(),
-      },
-    });
+    const res = await server.post("/api/relationships.info", user);
     const body = await res.json();
     expect(res.status).toEqual(400);
     expect(body.message).toEqual(
@@ -68,9 +64,8 @@ describe("#relationships.info", () => {
   });
 
   it("should fail with status 400 bad request when id is not a valid UUID", async () => {
-    const res = await server.post("/api/relationships.info", {
+    const res = await server.post("/api/relationships.info", user, {
       body: {
-        token: user.getJwtToken(),
         id: "invalid-uuid",
       },
     });
@@ -80,9 +75,8 @@ describe("#relationships.info", () => {
   });
 
   it("should fail with status 404 not found when relationship does not exist", async () => {
-    const res = await server.post("/api/relationships.info", {
+    const res = await server.post("/api/relationships.info", admin, {
       body: {
-        token: admin.getJwtToken(),
         id: "550e8400-e29b-41d4-a716-446655440000",
       },
     });
@@ -92,9 +86,8 @@ describe("#relationships.info", () => {
   });
 
   it("should fail with status 403 forbidden when user cannot read the document", async () => {
-    const res = await server.post("/api/relationships.info", {
+    const res = await server.post("/api/relationships.info", anotherUser, {
       body: {
-        token: anotherUser.getJwtToken(),
         id: relationship.id,
       },
     });
@@ -104,9 +97,8 @@ describe("#relationships.info", () => {
   });
 
   it("should succeed with status 200 ok when user can read the document", async () => {
-    const res = await server.post("/api/relationships.info", {
+    const res = await server.post("/api/relationships.info", admin, {
       body: {
-        token: admin.getJwtToken(),
         id: relationship.id,
       },
     });
@@ -143,9 +135,8 @@ describe("#relationships.info", () => {
       reverseDocumentId: adminDocument.id,
     });
 
-    const res = await server.post("/api/relationships.info", {
+    const res = await server.post("/api/relationships.info", user, {
       body: {
-        token: user.getJwtToken(),
         id: userRelationship.id,
       },
     });
@@ -155,7 +146,9 @@ describe("#relationships.info", () => {
     expect(body.data.relationship).toBeTruthy();
     expect(body.data.documents).toHaveLength(2);
     // User can read their own document but admin document should also be included
-    const documentIds = body.data.documents.map((doc: any) => doc.id);
+    const documentIds = body.data.documents.map(
+      (doc: { id: string }) => doc.id
+    );
     expect(documentIds).toContain(userDocument.id);
   });
 
@@ -163,16 +156,17 @@ describe("#relationships.info", () => {
     // Make user team member so they can read both documents
     const teamUser = await buildUser({ teamId: admin.teamId });
 
-    const res = await server.post("/api/relationships.info", {
+    const res = await server.post("/api/relationships.info", teamUser, {
       body: {
-        token: teamUser.getJwtToken(),
         id: relationship.id,
       },
     });
     const body = await res.json();
     expect(res.status).toEqual(200);
     expect(body.data.documents).toHaveLength(2);
-    const documentIds = body.data.documents.map((doc: any) => doc.id);
+    const documentIds = body.data.documents.map(
+      (doc: { id: string }) => doc.id
+    );
     expect(documentIds).toContain(document.id);
     expect(documentIds).toContain(reverseDocument.id);
   });
@@ -181,8 +175,8 @@ describe("#relationships.info", () => {
 describe("#relationships.list", () => {
   let admin: User;
   let user: User;
-  let anotherUser: User; // eslint-disable-line @typescript-eslint/no-unused-vars
-  let relationships: Relationship[]; // eslint-disable-line @typescript-eslint/no-unused-vars
+  let anotherUser: User; // oxlint-disable-line @typescript-eslint/no-unused-vars
+  let relationships: Relationship[]; // oxlint-disable-line @typescript-eslint/no-unused-vars
   let documents: Document[];
 
   beforeEach(async () => {
@@ -238,26 +232,33 @@ describe("#relationships.list", () => {
     expect(body.message).toEqual("Authentication required");
   });
 
-  it("should succeed with status 200 ok returning all relationships", async () => {
-    const res = await server.post("/api/relationships.list", {
+  it("should fail with status 400 bad request when no anchor document is supplied", async () => {
+    const res = await server.post("/api/relationships.list", admin);
+    const body = await res.json();
+    expect(res.status).toEqual(400);
+    expect(body.message).toContain(
+      "One of documentId or reverseDocumentId is required"
+    );
+  });
+
+  it("should fail with status 400 bad request when both anchor documents are supplied", async () => {
+    const res = await server.post("/api/relationships.list", admin, {
       body: {
-        token: admin.getJwtToken(),
+        documentId: documents[0].id,
+        reverseDocumentId: documents[1].id,
       },
     });
     const body = await res.json();
-    expect(res.status).toEqual(200);
-    expect(body.data).toBeTruthy();
-    expect(body.data.relationships).toBeTruthy();
-    expect(body.data.relationships.length).toBeGreaterThanOrEqual(3);
-    expect(body.data.documents).toBeTruthy();
-    expect(body.pagination).toBeTruthy();
-    expect(body.policies).toBeTruthy();
+    expect(res.status).toEqual(400);
+    expect(body.message).toContain(
+      "One of documentId or reverseDocumentId is required"
+    );
   });
 
   it("should succeed with status 200 ok returning relationships filtered by type", async () => {
-    const res = await server.post("/api/relationships.list", {
+    const res = await server.post("/api/relationships.list", admin, {
       body: {
-        token: admin.getJwtToken(),
+        documentId: documents[0].id,
         type: RelationshipType.Backlink,
       },
     });
@@ -267,15 +268,14 @@ describe("#relationships.list", () => {
     expect(body.data.relationships).toBeTruthy();
 
     // All returned relationships should be backlinks
-    body.data.relationships.forEach((rel: any) => {
+    body.data.relationships.forEach((rel: { type: RelationshipType }) => {
       expect(rel.type).toEqual(RelationshipType.Backlink);
     });
   });
 
   it("should succeed with status 200 ok returning relationships filtered by documentId", async () => {
-    const res = await server.post("/api/relationships.list", {
+    const res = await server.post("/api/relationships.list", admin, {
       body: {
-        token: admin.getJwtToken(),
         documentId: documents[0].id,
       },
     });
@@ -285,15 +285,14 @@ describe("#relationships.list", () => {
     expect(body.data.relationships).toBeTruthy();
 
     // All returned relationships should have the specified documentId
-    body.data.relationships.forEach((rel: any) => {
+    body.data.relationships.forEach((rel: { documentId: string }) => {
       expect(rel.documentId).toEqual(documents[0].id);
     });
   });
 
   it("should succeed with status 200 ok returning relationships filtered by reverseDocumentId", async () => {
-    const res = await server.post("/api/relationships.list", {
+    const res = await server.post("/api/relationships.list", admin, {
       body: {
-        token: admin.getJwtToken(),
         reverseDocumentId: documents[1].id,
       },
     });
@@ -303,15 +302,14 @@ describe("#relationships.list", () => {
     expect(body.data.relationships).toBeTruthy();
 
     // All returned relationships should have the specified reverseDocumentId
-    body.data.relationships.forEach((rel: any) => {
+    body.data.relationships.forEach((rel: { reverseDocumentId: string }) => {
       expect(rel.reverseDocumentId).toEqual(documents[1].id);
     });
   });
 
   it("should succeed with status 200 ok returning relationships with multiple filters", async () => {
-    const res = await server.post("/api/relationships.list", {
+    const res = await server.post("/api/relationships.list", admin, {
       body: {
-        token: admin.getJwtToken(),
         type: RelationshipType.Backlink,
         documentId: documents[0].id,
       },
@@ -322,16 +320,17 @@ describe("#relationships.list", () => {
     expect(body.data.relationships).toBeTruthy();
 
     // All returned relationships should match both filters
-    body.data.relationships.forEach((rel: any) => {
-      expect(rel.type).toEqual(RelationshipType.Backlink);
-      expect(rel.documentId).toEqual(documents[0].id);
-    });
+    body.data.relationships.forEach(
+      (rel: { type: RelationshipType; documentId: string }) => {
+        expect(rel.type).toEqual(RelationshipType.Backlink);
+        expect(rel.documentId).toEqual(documents[0].id);
+      }
+    );
   });
 
   it("should fail with status 400 bad request when documentId is invalid", async () => {
-    const res = await server.post("/api/relationships.list", {
+    const res = await server.post("/api/relationships.list", admin, {
       body: {
-        token: admin.getJwtToken(),
         documentId: "invalid-id",
       },
     });
@@ -339,9 +338,8 @@ describe("#relationships.list", () => {
   });
 
   it("should fail with status 400 bad request when reverseDocumentId is invalid", async () => {
-    const res = await server.post("/api/relationships.list", {
+    const res = await server.post("/api/relationships.list", admin, {
       body: {
-        token: admin.getJwtToken(),
         reverseDocumentId: "invalid-id",
       },
     });
@@ -351,9 +349,9 @@ describe("#relationships.list", () => {
   });
 
   it("should respect pagination", async () => {
-    const res = await server.post("/api/relationships.list", {
+    const res = await server.post("/api/relationships.list", admin, {
       body: {
-        token: admin.getJwtToken(),
+        documentId: documents[1].id,
         limit: 1,
         offset: 0,
       },
@@ -366,17 +364,31 @@ describe("#relationships.list", () => {
     expect(body.pagination.offset).toEqual(0);
   });
 
-  it("should return empty results when no relationships match filters", async () => {
-    const res = await server.post("/api/relationships.list", {
+  it("should fail with status 404 not found when the anchor document does not exist", async () => {
+    const res = await server.post("/api/relationships.list", admin, {
       body: {
-        token: admin.getJwtToken(),
         documentId: "550e8400-e29b-41d4-a716-446655440000",
       },
     });
-    const body = await res.json();
-    expect(res.status).toEqual(200);
-    expect(body.data.relationships).toHaveLength(0);
-    expect(body.data.documents).toHaveLength(0);
+    expect(res.status).toEqual(404);
+  });
+
+  it("should fail with status 403 forbidden when user cannot read the anchor document", async () => {
+    const cannotAccessCollection = await buildCollection({
+      teamId: user.teamId,
+      permission: null,
+    });
+    const cannotAccessDocument = await buildDocument({
+      collectionId: cannotAccessCollection.id,
+      teamId: user.teamId,
+    });
+
+    const res = await server.post("/api/relationships.list", user, {
+      body: {
+        documentId: cannotAccessDocument.id,
+      },
+    });
+    expect(res.status).toEqual(403);
   });
 
   it("should only return documents that the user can read", async () => {
@@ -405,15 +417,49 @@ describe("#relationships.list", () => {
       reverseDocumentId: cannotAccessDocument.id,
     });
 
-    const res = await server.post("/api/relationships.list", {
+    const res = await server.post("/api/relationships.list", user, {
       body: {
-        token: user.getJwtToken(),
         documentId: userDocument.id,
       },
     });
     const body = await res.json();
     expect(res.status).toEqual(200);
 
+    expect(body.data.relationships).toHaveLength(0);
+    expect(body.data.documents).toHaveLength(0);
+  });
+
+  it("should not disclose documents that the user cannot read when anchored on reverseDocumentId", async () => {
+    const cannotAccessCollection = await buildCollection({
+      teamId: user.teamId,
+      permission: null,
+    });
+    const collection = await buildCollection({
+      teamId: user.teamId,
+      permission: CollectionPermission.Read,
+    });
+    const userDocument = await buildDocument({
+      collectionId: collection.id,
+      teamId: user.teamId,
+    });
+    const cannotAccessDocument = await buildDocument({
+      collectionId: cannotAccessCollection.id,
+      teamId: user.teamId,
+    });
+
+    await buildRelationship({
+      userId: user.id,
+      documentId: cannotAccessDocument.id,
+      reverseDocumentId: userDocument.id,
+    });
+
+    const res = await server.post("/api/relationships.list", user, {
+      body: {
+        reverseDocumentId: userDocument.id,
+      },
+    });
+    const body = await res.json();
+    expect(res.status).toEqual(200);
     expect(body.data.relationships).toHaveLength(0);
     expect(body.data.documents).toHaveLength(0);
   });

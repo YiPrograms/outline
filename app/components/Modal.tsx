@@ -4,8 +4,8 @@ import { CloseIcon, BackIcon } from "outline-icons";
 import * as React from "react";
 import { useTranslation } from "react-i18next";
 import styled from "styled-components";
-import breakpoint from "styled-components-breakpoint";
-import { depths, s } from "@shared/styles";
+import { breakpoint } from "@shared/styles/breakpoint";
+import { depths, s, borderRadius } from "@shared/styles";
 import Flex from "~/components/Flex";
 import NudeButton from "~/components/NudeButton";
 import Scrollable from "~/components/Scrollable";
@@ -15,8 +15,8 @@ import usePrevious from "~/hooks/usePrevious";
 import { fadeAndScaleIn, fadeIn } from "~/styles/animations";
 import Desktop from "~/utils/Desktop";
 import ErrorBoundary from "./ErrorBoundary";
-import * as VisuallyHidden from "@radix-ui/react-visually-hidden";
 import Tooltip from "./Tooltip";
+import { useDialogContext } from "~/components/DialogContext";
 
 type Props = {
   children?: React.ReactNode;
@@ -31,7 +31,7 @@ type Props = {
 const Modal: React.FC<Props> = ({
   children,
   isOpen,
-  title = "Untitled",
+  title,
   style,
   width,
   height,
@@ -40,42 +40,43 @@ const Modal: React.FC<Props> = ({
   const wasOpen = usePrevious(isOpen);
   const isMobile = useMobile();
   const { t } = useTranslation();
+  const resolvedTitle = title ?? t("Untitled");
+  const dialog = useDialogContext();
+
+  const onClose = React.useCallback(() => {
+    dialog.setAnimating(false); // Reset
+    onRequestClose();
+  }, [dialog, onRequestClose]);
 
   if (!isOpen && !wasOpen) {
     return null;
   }
 
   return (
-    <Dialog.Root
-      open={isOpen}
-      onOpenChange={(open) => !open && onRequestClose()}
-    >
+    <Dialog.Root open={isOpen} onOpenChange={(open) => !open && onClose()}>
       <Dialog.Portal>
         <StyledOverlay />
-        <Dialog.Title asChild>
-          <VisuallyHidden.Root>{title}</VisuallyHidden.Root>
-        </Dialog.Title>
         <StyledContent
-          onEscapeKeyDown={onRequestClose}
-          onPointerDownOutside={onRequestClose}
+          onEscapeKeyDown={onClose}
+          onPointerDownOutside={onClose}
           aria-describedby={undefined}
         >
           {isMobile ? (
             <Mobile>
               <MobileContent>
                 <Centered onClick={(ev) => ev.stopPropagation()} column>
-                  {title && (
+                  <Dialog.Title asChild>
                     <Text size="xlarge" weight="bold">
-                      {title}
+                      {resolvedTitle}
                     </Text>
-                  )}
+                  </Dialog.Title>
                   <ErrorBoundary>{children}</ErrorBoundary>
                 </Centered>
               </MobileContent>
-              <Close onClick={onRequestClose}>
+              <Close onClick={onClose}>
                 <CloseIcon size={32} />
               </Close>
-              <Back onClick={onRequestClose}>
+              <Back onClick={onClose}>
                 <BackIcon size={32} />
                 <Text>{t("Back")} </Text>
               </Back>
@@ -85,17 +86,24 @@ const Modal: React.FC<Props> = ({
               <Centered
                 onClick={(ev) => ev.stopPropagation()}
                 // maxHeight needed for proper overflow behavior in Safari
-                style={{ maxHeight: "65vh" }}
+                style={{ maxHeight: height ? maxModalHeight(height) : "65vh" }}
                 column
                 reverse
               >
-                <DesktopContent style={style} topShadow>
+                <DesktopContent
+                  style={style}
+                  topShadow
+                  overflow={dialog.animating ? "hidden" : undefined}
+                  onAnimationEnd={() => dialog.setAnimating(false)}
+                >
                   <ErrorBoundary component="div">{children}</ErrorBoundary>
                 </DesktopContent>
                 <Header>
-                  {title && <Text size="large">{title}</Text>}
+                  <Dialog.Title asChild>
+                    <Text size="large">{resolvedTitle}</Text>
+                  </Dialog.Title>
                   <Tooltip content={t("Close")} shortcut="Esc">
-                    <NudeButton onClick={onRequestClose}>
+                    <NudeButton onClick={onClose} aria-label={t("Close")}>
                       <CloseIcon />
                     </NudeButton>
                   </Tooltip>
@@ -108,6 +116,10 @@ const Modal: React.FC<Props> = ({
     </Dialog.Root>
   );
 };
+
+// Limit the requested height so that the modal stays within the viewport.
+const maxModalHeight = (value: number | string) =>
+  `min(${typeof value === "number" ? `${value}px` : value}, 90vh)`;
 
 const StyledOverlay = styled(Dialog.Overlay)`
   position: fixed;
@@ -217,6 +229,17 @@ const Header = styled(Flex)`
   font-weight: 600;
   padding: 24px 24px 12px;
   flex-shrink: 0;
+  gap: 8px;
+
+  // Allows a long title to wrap or truncate instead of pushing out the close
+  // button
+  > :first-child {
+    min-width: 0;
+  }
+
+  > :last-child {
+    flex-shrink: 0;
+  }
 `;
 
 const Wrapper = styled.div<{
@@ -225,18 +248,26 @@ const Wrapper = styled.div<{
 }>`
   animation: ${fadeAndScaleIn} 250ms ease;
 
-  margin: 25vh auto auto auto;
+  // Move taller modals up so that they remain within the viewport.
+  margin-top: ${(props) =>
+    props.$height
+      ? `min(25vh, calc(95vh - ${maxModalHeight(props.$height)}))`
+      : "25vh"};
+  margin-right: auto;
+  margin-bottom: auto;
+  margin-left: auto;
   width: 75vw;
   min-width: 350px;
   max-width: ${(props) => props.$width || "450px"};
-  max-height: ${(props) => props.$height || "70vh"};
+  max-height: ${(props) =>
+    props.$height ? maxModalHeight(props.$height) : "70vh"};
   z-index: ${depths.modal};
   display: flex;
   justify-content: center;
   align-items: flex-start;
   background: ${s("modalBackground")};
   box-shadow: ${s("modalShadow")};
-  border-radius: 8px;
+  ${borderRadius(10)}
   outline: none;
 
   ${NudeButton} {

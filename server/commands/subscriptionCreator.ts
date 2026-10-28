@@ -1,7 +1,7 @@
-import { QueryTypes } from "sequelize";
+import { type InferAttributes, QueryTypes, type Transaction } from "sequelize";
 import { SubscriptionType } from "@shared/types";
 import { createContext } from "@server/context";
-import type { Document } from "@server/models";
+import type { Document, User } from "@server/models";
 import { Subscription, Event } from "@server/models";
 import { sequelize } from "@server/storage/database";
 import type { APIContext, DocumentEvent, RevisionEvent } from "@server/types";
@@ -19,6 +19,9 @@ type Props = {
   resubscribe?: boolean;
 };
 
+/** A subscription row with a flag reporting whether the upsert inserted it. */
+type SubscriptionRow = InferAttributes<Subscription> & { inserted: boolean };
+
 /**
  * This command creates a subscription of a user to a document.
  *
@@ -33,15 +36,15 @@ export default async function subscriptionCreator({
 }: Props): Promise<Subscription> {
   const { user } = ctx.state.auth;
 
-  let rows;
+  let rows: SubscriptionRow[];
   const now = new Date();
   if (documentId) {
-    rows = await sequelize.query(
+    rows = await sequelize.query<SubscriptionRow>(
       `INSERT INTO subscriptions ("id", "userId", "documentId", "event", "createdAt", "updatedAt")
        VALUES (gen_random_uuid(), :userId, :documentId, :event, :now, :now)
        ON CONFLICT ("userId", "documentId", "event")
        DO UPDATE SET "updatedAt" = EXCLUDED."updatedAt"
-       RETURNING *`,
+       RETURNING *, (xmax = 0) AS "inserted"`,
       {
         replacements: {
           userId: user.id,
@@ -54,12 +57,12 @@ export default async function subscriptionCreator({
       }
     );
   } else if (collectionId) {
-    rows = await sequelize.query(
+    rows = await sequelize.query<SubscriptionRow>(
       `INSERT INTO subscriptions ("id", "userId", "collectionId", "event", "createdAt", "updatedAt")
        VALUES (gen_random_uuid(), :userId, :collectionId, :event, :now, :now)
        ON CONFLICT ("userId", "collectionId", "event")
        DO UPDATE SET "updatedAt" = EXCLUDED."updatedAt"
-       RETURNING *`,
+       RETURNING *, (xmax = 0) AS "inserted"`,
       {
         replacements: {
           userId: user.id,
@@ -79,15 +82,15 @@ export default async function subscriptionCreator({
     throw new Error("Failed to create or find subscription");
   }
 
-  // Build subscription instance from the returned row
-  const subscription = Subscription.build(rows[0], {
+  // xmax is zero only for a row this statement inserted.
+  const { inserted, ...row } = rows[0];
+  const subscription = Subscription.build(row, {
     isNewRecord: false,
     include: [],
     raw: true,
   });
 
-  const isNew = subscription.createdAt.getTime() === now.getTime();
-  if (isNew) {
+  if (inserted) {
     await Event.createFromContext(ctx, {
       name: "subscriptions.create",
       modelId: subscription.id,
@@ -106,33 +109,80 @@ export default async function subscriptionCreator({
 }
 
 /**
+ * Subscribe a single user to a document. The subscription is created if it
+ * does not exist; an existing subscription that has been deleted is left as-is
+ * so that the user's prior unsubscribe is respected.
+ *
+ * @param user The user to subscribe.
+ * @param document The document to subscribe the user to.
+ * @param event The event that triggered the subscription creation.
+ * @param options.transaction An existing transaction to run within. When
+ * subscribing many users in a row, callers should open a single transaction
+ * and pass it in to avoid the overhead of one BEGIN/COMMIT per call.
+ */
+export const subscribeUserToDocument = async (
+  user: User,
+  document: Document,
+  event: DocumentEvent | RevisionEvent,
+  options: { transaction?: Transaction } = {}
+): Promise<void> => {
+  const run = (transaction: Transaction) =>
+    subscriptionCreator({
+      ctx: createContext({
+        user,
+        authType: event.authType,
+        ip: event.ip,
+        transaction,
+      }),
+      documentId: document.id,
+      event: SubscriptionType.Document,
+      resubscribe: false,
+    });
+
+  if (options.transaction) {
+    await run(options.transaction);
+    return;
+  }
+
+  await sequelize.transaction(run);
+};
+
+/**
+ * Subscribe a batch of users to a document inside a single transaction.
+ *
+ * @param users The users to subscribe.
+ * @param document The document to subscribe the users to.
+ * @param event The event that triggered the subscription creation.
+ */
+export const subscribeUsersToDocument = async (
+  users: User[],
+  document: Document,
+  event: DocumentEvent | RevisionEvent
+): Promise<void> => {
+  if (!users.length) {
+    return;
+  }
+
+  await sequelize.transaction(async (transaction) => {
+    for (const user of users) {
+      await subscribeUserToDocument(user, document, event, { transaction });
+    }
+  });
+};
+
+/**
  * Create any new subscriptions that might be missing for collaborators in the
  * document on publish and revision creation. This does mean that there is a
  * short period of time where the user is not subscribed after editing until a
  * revision is created.
  *
- * @param document The document to create subscriptions for
- * @param event The event that triggered the subscription creation
+ * @param document The document to create subscriptions for.
+ * @param event The event that triggered the subscription creation.
  */
 export const createSubscriptionsForDocument = async (
   document: Document,
   event: DocumentEvent | RevisionEvent
 ): Promise<void> => {
   const users = await document.collaborators();
-
-  for (const user of users) {
-    await sequelize.transaction(async (transaction) => {
-      await subscriptionCreator({
-        ctx: createContext({
-          user,
-          authType: event.authType,
-          ip: event.ip,
-          transaction,
-        }),
-        documentId: document.id,
-        event: SubscriptionType.Document,
-        resubscribe: false,
-      });
-    });
-  }
+  await subscribeUsersToDocument(users, document, event);
 };

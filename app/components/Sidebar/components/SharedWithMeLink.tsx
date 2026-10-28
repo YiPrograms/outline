@@ -2,32 +2,36 @@ import fractionalIndex from "fractional-index";
 import type { Location } from "history";
 import { observer } from "mobx-react";
 import * as React from "react";
-import styled from "styled-components";
+import type { match } from "react-router";
 import { IconType, NotificationEventType } from "@shared/types";
 import { determineIconType } from "@shared/utils/icon";
 import type GroupMembership from "~/models/GroupMembership";
 import UserMembership from "~/models/UserMembership";
-import Fade from "~/components/Fade";
+import { useActiveSidebarContext } from "~/hooks/useActiveSidebarContext";
 import useBoolean from "~/hooks/useBoolean";
-import { useLocationSidebarContext } from "~/hooks/useLocationSidebarContext";
+import { useComputed } from "~/hooks/useComputed";
 import useStores from "~/hooks/useStores";
 import DocumentMenu from "~/menus/DocumentMenu";
+import * as Scenes from "~/routes/scenes";
 import {
   useDragMembership,
   useDropToReorderUserMembership,
   useDropToReparentDocument,
 } from "../hooks/useDragAndDrop";
+import SidebarExpansionContext, {
+  useSidebarExpansionState,
+} from "./SidebarExpansionContext";
 import { useSidebarLabelAndIcon } from "../hooks/useSidebarLabelAndIcon";
-import DocumentLink from "./DocumentLink";
+import { DocumentTree } from "./DocumentTree";
+import DocumentRow from "./DocumentRow";
 import DropCursor from "./DropCursor";
 import Folder from "./Folder";
-import Relative from "./Relative";
 import SidebarDisclosureContext, {
   useSidebarDisclosure,
   useSidebarDisclosureState,
 } from "./SidebarDisclosureContext";
 import { useSidebarContext, type SidebarContextType } from "./SidebarContext";
-import SidebarLink from "./SidebarLink";
+import { useSidebarNavigation } from "./SidebarNavigation";
 
 type Props = {
   membership: UserMembership | GroupMembership;
@@ -39,33 +43,41 @@ function SharedWithMeLink({ membership, depth = 0 }: Props) {
   const { fetchChildDocuments } = documents;
   const [menuOpen, handleMenuOpen, handleMenuClose] = useBoolean();
   const { documentId } = membership;
-  const isActiveDocument = documentId === ui.activeDocumentId;
-  const locationSidebarContext = useLocationSidebarContext();
+  const isActiveDocument = useComputed(
+    () => documentId === ui.activeDocumentId,
+    [documentId, ui]
+  );
+  const activeSidebarContext = useActiveSidebarContext();
   const sidebarContext = useSidebarContext();
   const document = documentId ? documents.get(documentId) : undefined;
 
-  const isActiveDocumentInPath = ui.activeDocumentId
-    ? membership.pathToDocument(ui.activeDocumentId).length > 0
-    : false;
+  const membershipDocuments = membership.documents;
+  const expansion = useSidebarExpansionState(membershipDocuments);
+  const isActiveDocumentInPath = useComputed(
+    () =>
+      ui.activeDocumentId
+        ? membership.pathToDocument(ui.activeDocumentId).length > 0
+        : false,
+    [membership, ui]
+  );
 
   const [expanded, setExpanded, setCollapsed] = useBoolean(
-    isActiveDocumentInPath && locationSidebarContext === sidebarContext
+    isActiveDocumentInPath && activeSidebarContext === sidebarContext
   );
 
   const { event: disclosureEvent, onDisclosureClick } =
     useSidebarDisclosureState();
 
-  // Subscribe to recursive expand/collapse events from an ancestor (e.g. GroupLink)
   useSidebarDisclosure(setExpanded, setCollapsed);
 
   React.useEffect(() => {
-    if (isActiveDocumentInPath && locationSidebarContext === sidebarContext) {
+    if (isActiveDocumentInPath && activeSidebarContext === sidebarContext) {
       setExpanded();
     }
   }, [
     isActiveDocumentInPath,
     sidebarContext,
-    locationSidebarContext,
+    activeSidebarContext,
     setExpanded,
   ]);
 
@@ -74,7 +86,7 @@ function SharedWithMeLink({ membership, depth = 0 }: Props) {
       void documents.fetch(documentId);
       void membership.fetchDocuments();
     }
-  }, [documentId, documents]);
+  }, [documentId, documents, membership]);
 
   React.useEffect(() => {
     if (isActiveDocument && membership.documentId) {
@@ -83,18 +95,31 @@ function SharedWithMeLink({ membership, depth = 0 }: Props) {
   }, [fetchChildDocuments, isActiveDocument, membership.documentId]);
 
   const handleDisclosureClick = React.useCallback(
-    (ev: React.MouseEvent<HTMLButtonElement>) => {
-      ev.preventDefault();
-      ev.stopPropagation();
+    (ev?: React.MouseEvent<HTMLElement>) => {
+      ev?.preventDefault();
+      ev?.stopPropagation();
       const willExpand = !expanded;
       if (willExpand) {
         setExpanded();
+        if (ev?.altKey && membershipDocuments) {
+          expansion.expandAll(membershipDocuments);
+        }
       } else {
         setCollapsed();
+        if (ev?.altKey) {
+          expansion.collapseAll();
+        }
       }
-      onDisclosureClick(willExpand, ev.altKey);
+      onDisclosureClick(willExpand, !!ev?.altKey);
     },
-    [expanded, setExpanded, setCollapsed, onDisclosureClick]
+    [
+      expanded,
+      setExpanded,
+      setCollapsed,
+      onDisclosureClick,
+      expansion,
+      membershipDocuments,
+    ]
   );
 
   const parentRef = React.useRef<HTMLDivElement>(null);
@@ -102,8 +127,11 @@ function SharedWithMeLink({ membership, depth = 0 }: Props) {
     () => document?.asNavigationNode,
     [document]
   );
-  const [{ isOverReparent, canDropToReparent }, dropToReparent] =
-    useDropToReparentDocument(reparentableNode, setExpanded, parentRef);
+  const [{ isOverReparent }, dropToReparent] = useDropToReparentDocument(
+    reparentableNode,
+    undefined,
+    setExpanded
+  );
 
   const { icon } = useSidebarLabelAndIcon(membership);
   const [{ isDragging }, draggableRef] = useDragMembership(membership);
@@ -118,107 +146,116 @@ function SharedWithMeLink({ membership, depth = 0 }: Props) {
   const [reorderProps, dropToReorderRef] =
     useDropToReorderUserMembership(getIndex);
 
+  const isActive = React.useCallback(
+    (
+      match: match | null,
+      location: Location<{ sidebarContext?: SidebarContextType }>
+    ) => !!match && location.state?.sidebarContext === sidebarContext,
+    [sidebarContext]
+  );
+
   const displayChildDocuments = expanded && !isDragging;
 
-  if (document) {
-    const { icon: docIcon } = document;
-    const label =
-      determineIconType(docIcon) === IconType.Emoji
-        ? document.title.replace(docIcon!, "")
-        : document.titleWithDefault;
-    const collection = document.collectionId
-      ? collections.get(document.collectionId)
-      : undefined;
+  const getNavigationItems = React.useCallback(
+    () =>
+      document
+        ? [
+            {
+              id: document.id,
+              url: document.path,
+              title: document.title,
+              sidebarContext,
+              collapsedChildren: displayChildDocuments
+                ? undefined
+                : membershipDocuments,
+            },
+          ]
+        : [],
+    [document, sidebarContext, displayChildDocuments, membershipDocuments]
+  );
+  useSidebarNavigation(parentRef, getNavigationItems);
 
-    const childDocuments = membership.documents ?? [];
+  if (!document) {
+    return null;
+  }
 
-    return (
-      <>
-        <Relative ref={parentRef}>
-          <Draggable
-            key={membership.id}
-            ref={draggableRef}
-            $isDragging={isDragging}
-          >
-            <div ref={dropToReparent}>
-              <SidebarLink
-                isActiveDrop={isOverReparent && canDropToReparent}
-                depth={depth}
-                to={{
-                  pathname: document.path,
-                  state: { sidebarContext },
-                }}
-                expanded={
-                  childDocuments.length > 0 && !isDragging
-                    ? expanded
-                    : undefined
-                }
-                onDisclosureClick={handleDisclosureClick}
-                icon={icon}
-                isActive={(
-                  match,
-                  location: Location<{ sidebarContext?: SidebarContextType }>
-                ) =>
-                  !!match && location.state?.sidebarContext === sidebarContext
-                }
-                label={label}
-                exact={false}
-                unreadBadge={
-                  document.unreadNotifications.filter(
-                    (notification) =>
-                      notification.event ===
-                      NotificationEventType.AddUserToDocument
-                  ).length > 0
-                }
-                $showActions={menuOpen}
-                menu={
-                  document && !isDragging ? (
-                    <Fade>
-                      <DocumentMenu
-                        document={document}
-                        onOpen={handleMenuOpen}
-                        onClose={handleMenuClose}
-                      />
-                    </Fade>
-                  ) : undefined
-                }
-              />
-            </div>
-          </Draggable>
-        </Relative>
-        <SidebarDisclosureContext.Provider value={disclosureEvent}>
-          <Folder expanded={displayChildDocuments}>
-            {childDocuments.map((childNode, index) => (
-              <DocumentLink
-                key={childNode.id}
-                node={childNode}
-                collection={collection}
-                membership={membership}
-                activeDocument={documents.active}
-                isDraft={childNode.isDraft}
-                depth={2}
-                index={index}
-              />
-            ))}
-          </Folder>
-        </SidebarDisclosureContext.Provider>
-        {reorderProps.isDragging && (
+  const { icon: docIcon } = document;
+  const label =
+    determineIconType(docIcon) === IconType.Emoji
+      ? document.title.replace(docIcon!, "")
+      : document.displayTitle;
+  const collection = document.collectionId
+    ? collections.get(document.collectionId)
+    : undefined;
+
+  const childDocuments = membershipDocuments ?? [];
+  const hasChildren = childDocuments.length > 0;
+
+  const unreadBadge =
+    document.unreadNotifications.filter(
+      (notification) =>
+        notification.event === NotificationEventType.AddUserToDocument
+    ).length > 0;
+
+  const menu = !isDragging ? (
+    <DocumentMenu
+      document={document}
+      onOpen={handleMenuOpen}
+      onClose={handleMenuClose}
+    />
+  ) : undefined;
+
+  return (
+    <DocumentRow
+      documentId={documentId ?? ""}
+      document={document}
+      to={{ pathname: document.path, state: { sidebarContext } }}
+      onClickIntent={Scenes.Document.preload}
+      depth={depth}
+      icon={icon}
+      canEdit={false}
+      label={label}
+      unreadBadge={unreadBadge}
+      expanded={expanded && !isDragging}
+      hasChildren={hasChildren}
+      onDisclosureClick={handleDisclosureClick}
+      onExpand={setExpanded}
+      onCollapse={setCollapsed}
+      dragRef={draggableRef}
+      isDragging={isDragging}
+      parentRef={parentRef}
+      dropToReparentRef={dropToReparent}
+      isActiveDropTarget={isOverReparent}
+      cursorAfter={
+        reorderProps.isDragging ? (
           <DropCursor
             isActiveDrop={reorderProps.isOverCursor}
             innerRef={dropToReorderRef}
           />
-        )}
-      </>
-    );
-  }
-
-  return null;
+        ) : undefined
+      }
+      menu={menu}
+      menuOpen={menuOpen}
+      isActiveOverride={isActive}
+    >
+      <SidebarDisclosureContext.Provider value={disclosureEvent}>
+        <SidebarExpansionContext.Provider value={expansion}>
+          <Folder expanded={displayChildDocuments}>
+            <DocumentTree
+              nodes={childDocuments}
+              depth={depth + 1}
+              parentId={document.id}
+              collection={collection}
+              membership={membership}
+              // Loads the document and its policies on hover, without which
+              // rows that were never opened cannot be dragged or dropped on.
+              prefetchDocument={documents.prefetchDocument}
+            />
+          </Folder>
+        </SidebarExpansionContext.Provider>
+      </SidebarDisclosureContext.Provider>
+    </DocumentRow>
+  );
 }
-
-const Draggable = styled.div<{ $isDragging?: boolean }>`
-  position: relative;
-  transition: opacity 250ms ease;
-  opacity: ${(props) => (props.$isDragging ? 0.1 : 1)};
-`;
 
 export default observer(SharedWithMeLink);

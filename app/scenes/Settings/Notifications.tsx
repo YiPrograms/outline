@@ -1,4 +1,4 @@
-import debounce from "lodash/debounce";
+import { debounce } from "es-toolkit/compat";
 import { runInAction } from "mobx";
 import { observer } from "mobx-react";
 import {
@@ -36,7 +36,7 @@ function Notifications() {
 
   const options = [
     {
-      event: NotificationEventType.PublishDocument,
+      events: [NotificationEventType.PublishDocument],
       icon: <PublishIcon />,
       title: t("Document published"),
       description: t(
@@ -44,7 +44,7 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.UpdateDocument,
+      events: [NotificationEventType.UpdateDocument],
       icon: <EditIcon />,
       title: t("Document updated"),
       description: t(
@@ -52,7 +52,7 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.CreateComment,
+      events: [NotificationEventType.CreateComment],
       icon: <CommentIcon />,
       title: t("Comment posted"),
       description: t(
@@ -60,7 +60,10 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.MentionedInComment,
+      events: [
+        NotificationEventType.MentionedInComment,
+        NotificationEventType.MentionedInDocument,
+      ],
       icon: <EmailIcon />,
       title: t("Mentioned"),
       description: t(
@@ -68,7 +71,10 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.GroupMentionedInDocument,
+      events: [
+        NotificationEventType.GroupMentionedInDocument,
+        NotificationEventType.GroupMentionedInComment,
+      ],
       icon: <GroupIcon />,
       title: t("Group mentions"),
       description: t(
@@ -76,7 +82,7 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.ResolveComment,
+      events: [NotificationEventType.ResolveComment],
       icon: <DoneIcon />,
       title: t("Resolved"),
       description: t(
@@ -84,7 +90,7 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.ReactionsCreate,
+      events: [NotificationEventType.ReactionsCreate],
       icon: <SmileyIcon />,
       title: t("Reaction added"),
       description: t(
@@ -92,7 +98,7 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.CreateCollection,
+      events: [NotificationEventType.CreateCollection],
       icon: <CollectionIcon />,
       title: t("Collection created"),
       description: t(
@@ -100,7 +106,7 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.InviteAccepted,
+      events: [NotificationEventType.InviteAccepted],
       icon: <UserIcon />,
       title: t("Invite accepted"),
       description: t(
@@ -108,7 +114,7 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.AddUserToDocument,
+      events: [NotificationEventType.AddUserToDocument],
       icon: <DocumentIcon />,
       title: t("Invited to document"),
       description: t(
@@ -116,7 +122,7 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.AddUserToCollection,
+      events: [NotificationEventType.AddUserToCollection],
       icon: <CollectionIcon />,
       title: t("Invited to collection"),
       description: t(
@@ -124,7 +130,15 @@ function Notifications() {
       ),
     },
     {
-      event: NotificationEventType.ExportCompleted,
+      events: [NotificationEventType.AddUserToGroup],
+      icon: <GroupIcon />,
+      title: t("Group membership"),
+      description: t(
+        "Receive a notification when you are added to or removed from a group"
+      ),
+    },
+    {
+      events: [NotificationEventType.ExportCompleted],
       icon: <CheckboxIcon checked />,
       title: t("Export completed"),
       description: t(
@@ -132,16 +146,24 @@ function Notifications() {
       ),
     },
     {
+      events: [NotificationEventType.RequestDocumentAccess],
+      icon: <CheckboxIcon checked />,
+      title: t("Document access requested"),
+      description: t(
+        "Receive a notification when a user requests access to a document you manage"
+      ),
+    },
+    {
       visible: isCloudHosted,
       icon: <AcademicCapIcon />,
-      event: NotificationEventType.Onboarding,
+      events: [NotificationEventType.Onboarding],
       title: t("Getting started"),
       description: t("Tips on getting started with features and functionality"),
     },
     {
       visible: isCloudHosted,
       icon: <StarredIcon />,
-      event: NotificationEventType.Features,
+      events: [NotificationEventType.Features],
       title: t("New features"),
       description: t("Receive an email when new features of note are added"),
     },
@@ -154,8 +176,11 @@ function Notifications() {
   }, 500);
 
   const handleChange = React.useCallback(
-    (eventType: NotificationEventType) => async (checked: boolean) => {
-      await user.setNotificationEventType(eventType, checked);
+    (eventTypes: NotificationEventType[]) => async (checked: boolean) => {
+      // Sequential, as each request saves the full settings object.
+      for (const eventType of eventTypes) {
+        await user.setNotificationEventType(eventType, checked);
+      }
       showSuccessMessage();
     },
     [user, showSuccessMessage]
@@ -166,7 +191,9 @@ function Notifications() {
       runInAction(() => {
         const updated = { ...user.notificationSettings };
         for (const option of visibleOptions) {
-          updated[option.event] = checked;
+          for (const eventType of option.events) {
+            updated[eventType] = checked;
+          }
         }
         user.notificationSettings = updated;
       });
@@ -181,7 +208,7 @@ function Notifications() {
   );
 
   const allEnabled = visibleOptions.every((o) =>
-    user.subscribedToEventType(o.event)
+    o.events.every((eventType) => user.subscribedToEventType(eventType))
   );
 
   const showSuccessNotice = window.location.search === "?success";
@@ -215,14 +242,17 @@ function Notifications() {
       </SettingRow>
 
       {options.map((option) => {
-        const setting = user.subscribedToEventType(option.event);
+        const [name] = option.events;
+        const checked = option.events.every((eventType) =>
+          user.subscribedToEventType(eventType)
+        );
 
         return (
           <SettingRow
-            key={option.event}
+            key={name}
             visible={option.visible}
             label={option.title}
-            name={option.event}
+            name={name}
             description={
               <Text size="small" type="secondary">
                 {option.description}
@@ -231,11 +261,11 @@ function Notifications() {
             compact
           >
             <Switch
-              key={option.event}
-              id={option.event}
-              name={option.event}
-              checked={!!setting}
-              onChange={handleChange(option.event)}
+              key={name}
+              id={name}
+              name={name}
+              checked={checked}
+              onChange={handleChange(option.events)}
             />
           </SettingRow>
         );

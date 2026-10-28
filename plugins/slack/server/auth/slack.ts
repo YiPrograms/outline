@@ -1,8 +1,9 @@
 import passport from "@outlinewiki/koa-passport";
-import type { Context } from "koa";
-import Router from "koa-router";
+import type { Request } from "koa";
+import Router from "@koa/router";
 import type { Profile } from "passport";
 import { Strategy as SlackStrategy } from "passport-slack-oauth2";
+import { toError } from "@shared/utils/error";
 import { IntegrationService, IntegrationType } from "@shared/types";
 import accountProvisioner from "@server/commands/accountProvisioner";
 import { ValidationError } from "@server/errors";
@@ -19,17 +20,23 @@ import {
 import { authorize } from "@server/policies";
 import { sequelize } from "@server/storage/database";
 import type { APIContext, AuthenticationResult } from "@server/types";
+import { verifyOAuthStateNonce } from "@server/utils/oauth";
 import {
   getClientFromOAuthState,
   getTeamFromContext,
   getUserFromOAuthState,
   StateStore,
+  startOAuthFlow,
+  withProxyAgent,
 } from "@server/utils/passport";
 import { parseEmail } from "@shared/utils/email";
 import env from "../env";
 import * as Slack from "../slack";
 import * as T from "./schema";
-import { SlackUtils } from "plugins/slack/shared/SlackUtils";
+import {
+  SlackUtils,
+  SlackOAuthNonceCookie,
+} from "plugins/slack/shared/SlackUtils";
 import { createContext } from "@server/context";
 
 type SlackProfile = Profile & {
@@ -65,12 +72,12 @@ if (env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET) {
       clientSecret: env.SLACK_CLIENT_SECRET,
       callbackURL: SlackUtils.callbackUrl(),
       passReqToCallback: true,
-      // @ts-expect-error StateStore
+      // @ts-expect-error Strategy typings target Express and do not match koa-passport usage
       store: new StateStore(),
       scope: scopes,
     },
     async function (
-      context: Context,
+      req: Request,
       accessToken: string,
       refreshToken: string,
       params: { expires_in: number },
@@ -81,6 +88,7 @@ if (env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET) {
         result?: AuthenticationResult
       ) => void
     ) {
+      const context = req.ctx;
       try {
         const team = await getTeamFromContext(context);
         const client = getClientFromOAuthState(context);
@@ -105,6 +113,8 @@ if (env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET) {
           user: {
             name: profile.user.name,
             email: profile.user.email,
+            // Slack only returns confirmed workspace email addresses.
+            emailVerified: true,
             avatarUrl: profile.user.image_192,
           },
           authenticationProvider: {
@@ -121,16 +131,16 @@ if (env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET) {
         });
         return done(null, result.user, { ...result, client });
       } catch (err) {
-        return done(err, null);
+        return done(toError(err), null);
       }
     }
   );
   // For some reason the author made the strategy name capatilised, I don't know
   // why but we need everything lowercase so we just monkey-patch it here.
   strategy.name = providerName;
-  passport.use(strategy);
+  passport.use(withProxyAgent(strategy));
 
-  router.get("slack", passport.authenticate(providerName));
+  router.get("slack", startOAuthFlow, passport.authenticate(providerName));
   router.get("slack.callback", passportMiddleware(providerName));
 
   router.get(
@@ -155,19 +165,20 @@ if (env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET) {
         return;
       }
 
-      let parsedState;
-      try {
-        parsedState = SlackUtils.parseState<{
-          collectionId: string;
-        }>(state);
-      } catch (_err) {
+      const parsedState = SlackUtils.parseState(state);
+      if (!parsedState) {
         throw ValidationError("Invalid state");
       }
+
+      verifyOAuthStateNonce(ctx, SlackOAuthNonceCookie, parsedState.nonce);
 
       const { collectionId, type } = parsedState;
 
       switch (type) {
         case IntegrationType.Post: {
+          if (!collectionId) {
+            throw ValidationError("collectionId is required");
+          }
           const collection = await Collection.findByPk(collectionId, {
             userId: user.id,
           });

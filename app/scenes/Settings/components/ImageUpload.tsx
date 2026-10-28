@@ -2,10 +2,12 @@ import invariant from "invariant";
 import { observer } from "mobx-react";
 import * as React from "react";
 import { useState, useRef } from "react";
-import AvatarEditor from "react-avatar-editor";
+import AvatarEditor, { type AvatarEditorRef } from "react-avatar-editor";
 import { useDropzone } from "react-dropzone";
 import { useTranslation } from "react-i18next";
 import styled from "styled-components";
+import { errToString } from "@shared/utils/error";
+import { dataUrlToFile } from "@shared/utils/files";
 import { s } from "@shared/styles";
 import { AttachmentPreset } from "@shared/types";
 import { AttachmentValidation } from "@shared/validations";
@@ -13,14 +15,15 @@ import ButtonLarge from "~/components/ButtonLarge";
 import Flex from "~/components/Flex";
 import LoadingIndicator from "~/components/LoadingIndicator";
 import useStores from "~/hooks/useStores";
-import { compressImage } from "~/utils/compressImage";
-import { uploadFile, dataUrlToBlob } from "~/utils/files";
+import { uploadFile, extname, toDropzoneAccept } from "~/utils/files";
+import { ImageHelper } from "~/utils/ImageHelper";
 
 export type Props = {
   onSuccess: (url: string | null) => void | Promise<void>;
   onError: (error: string) => void;
   submitText?: string;
   borderRadius?: number;
+  children?: React.ReactNode;
 };
 
 const ImageUpload: React.FC<Props> = ({
@@ -33,25 +36,23 @@ const ImageUpload: React.FC<Props> = ({
   const { dialogs } = useStores();
   const { t } = useTranslation();
 
-  const [isUploading, setIsUploading] = useState(false);
   const [isCropping, setIsCropping] = useState(false);
+  const [isConverting, setIsConverting] = useState(false);
 
   const uploadImage = React.useCallback(
-    async (blob: Blob, file: File) => {
+    async (file: File) => {
       try {
-        const compressed = await compressImage(blob, {
+        const compressed = await ImageHelper.compress(file, {
           maxHeight: 512,
           maxWidth: 512,
         });
         const attachment = await uploadFile(compressed, {
-          name: file.name,
           preset: AttachmentPreset.Avatar,
         });
         void onSuccess(attachment.url);
       } catch (err) {
-        onError(err.message);
+        onError(errToString(err));
       } finally {
-        setIsUploading(false);
         setIsCropping(false);
         dialogs.closeAllModals();
       }
@@ -60,30 +61,45 @@ const ImageUpload: React.FC<Props> = ({
   );
 
   const handleUpload = React.useCallback(
-    (blob: Blob, file: File) => {
-      setIsUploading(true);
-      // allow the UI to update before converting the canvas to a Blob
-      // for large images this can cause the page rendering to hang.
-      setTimeout(() => uploadImage(blob, file), 0);
+    (file: File) => {
+      void uploadImage(file);
     },
     [uploadImage]
   );
 
   const handleClose = React.useCallback(() => {
-    setIsUploading(false);
     setIsCropping(false);
   }, []);
 
   const onDropAccepted = React.useCallback(
     async (files: File[]) => {
+      let file = files[0];
+
+      // Most browsers cannot display HEIC images, so convert to JPEG before
+      // the image is shown in the cropper.
+      if (ImageHelper.isHeic(file)) {
+        setIsConverting(true);
+        const converted = await ImageHelper.convertHeicToJpeg(file);
+        setIsConverting(false);
+
+        if (!converted) {
+          onError(
+            t(
+              "Your browser cannot read HEIC images, please convert the image to JPEG or PNG first"
+            )
+          );
+          return;
+        }
+        file = converted;
+      }
+
       setIsCropping(true);
       dialogs.openModal({
         title: "",
         content: (
           <AvatarEditorDialog
-            file={files[0]}
+            file={file}
             onUpload={handleUpload}
-            isUploading={isUploading}
             borderRadius={borderRadius ?? 150}
             submitText={submitText || t("Crop image")}
           />
@@ -91,19 +107,11 @@ const ImageUpload: React.FC<Props> = ({
         onClose: handleClose,
       });
     },
-    [
-      t,
-      dialogs,
-      handleUpload,
-      handleClose,
-      isUploading,
-      borderRadius,
-      submitText,
-    ]
+    [t, dialogs, handleUpload, handleClose, onError, borderRadius, submitText]
   );
 
   const { getRootProps, getInputProps } = useDropzone({
-    accept: AttachmentValidation.avatarContentTypes.join(", "),
+    accept: avatarAccept,
     onDropAccepted,
   });
 
@@ -113,6 +121,7 @@ const ImageUpload: React.FC<Props> = ({
 
   return (
     <div {...getRootProps()}>
+      {isConverting && <LoadingIndicator />}
       <input {...getInputProps()} />
       {children}
     </div>
@@ -121,24 +130,34 @@ const ImageUpload: React.FC<Props> = ({
 
 type AvatarEditorDialogProps = {
   file: File;
-  onUpload: (blob: Blob, file: File) => void;
-  isUploading: boolean;
+  onUpload: (file: File) => void;
   borderRadius: number;
   submitText: string;
 };
 
 const AvatarEditorDialog: React.FC<AvatarEditorDialogProps> = observer(
-  ({ file, onUpload, isUploading, borderRadius, submitText }) => {
+  ({ file, onUpload, borderRadius, submitText }) => {
     const { ui } = useStores();
     const { t } = useTranslation();
     const [zoom, setZoom] = useState(1);
-    const avatarEditorRef = useRef<AvatarEditor>(null);
+    const [isUploading, setIsUploading] = useState(false);
+    const avatarEditorRef = useRef<AvatarEditorRef>(null);
 
     const handleUpload = React.useCallback(() => {
-      const canvas = avatarEditorRef.current?.getImage();
-      invariant(canvas, "canvas is not defined");
-      const blob = dataUrlToBlob(canvas.toDataURL());
-      onUpload(blob, file);
+      setIsUploading(true);
+      // Allow the button to render as disabled before the canvas is converted,
+      // which hangs rendering for large images.
+      setTimeout(() => {
+        const canvas = avatarEditorRef.current?.getImage();
+        invariant(canvas, "canvas is not defined");
+
+        // The canvas exports PNG, so the name must have a matching extension.
+        const basename = file.name.slice(
+          0,
+          file.name.length - extname(file.name).length
+        );
+        onUpload(dataUrlToFile(canvas.toDataURL(), `${basename}.png`));
+      }, 0);
     }, [file, onUpload]);
 
     const handleZoom = React.useCallback(
@@ -183,6 +202,10 @@ const AvatarEditorDialog: React.FC<AvatarEditorDialogProps> = observer(
       </Flex>
     );
   }
+);
+
+const avatarAccept = toDropzoneAccept(
+  AttachmentValidation.avatarInputContentTypes
 );
 
 const AvatarEditorContainer = styled(Flex)`

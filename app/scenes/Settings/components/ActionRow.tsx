@@ -1,6 +1,6 @@
 import { transparentize } from "polished";
 import styled from "styled-components";
-import breakpoint from "styled-components-breakpoint";
+import { breakpoint } from "@shared/styles/breakpoint";
 import { s } from "@shared/styles";
 import { HStack } from "~/components/primitives/HStack";
 
@@ -14,7 +14,7 @@ export const ActionRow = styled(HStack).attrs({
   bottom: 0;
   width: 100vw;
   padding: 16px 12px;
-  margin-left: -12px;
+  margin-inline-start: -12px;
 
   background: ${s("background")};
 

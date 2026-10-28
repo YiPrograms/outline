@@ -3,18 +3,17 @@ import type { Node } from "prosemirror-model";
 import { Selection, TextSelection } from "prosemirror-state";
 import type { EditorView } from "prosemirror-view";
 import { useCallback, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import styled from "styled-components";
 import Flex from "~/components/Flex";
 import Tooltip from "~/components/Tooltip";
 import Input from "~/editor/components/Input";
-import type { Dictionary } from "~/hooks/useDictionary";
 import ToolbarButton from "./ToolbarButton";
 import useOnClickOutside from "~/hooks/useOnClickOutside";
 
 type Props = {
   node?: Node;
   view: EditorView;
-  dictionary: Dictionary;
   autoFocus?: boolean;
   onLinkUpdate: () => void;
   onLinkRemove: () => void;
@@ -25,20 +24,20 @@ type Props = {
 export function MediaLinkEditor({
   node,
   view,
-  dictionary,
   onLinkUpdate,
   onLinkRemove,
   onEscape,
   onClickOutside,
 }: Props) {
+  const { t } = useTranslation();
   const url = (node?.attrs.href ?? node?.attrs.src) as string;
   const [localUrl, setLocalUrl] = useState(url);
   const wrapperRef = useRef<HTMLDivElement>(null);
 
-  // If we're attempting to edit an image, autofocus the input
-  // Not doing for embed type because it made the editor scroll to top
-  // unexpectedly–leaving that out for now
-  const isEditingImgUrl = node?.type.name === "image";
+  // Image and video nodes store their URL in `src` and autofocus the input.
+  // Embeds use `href` and do not autofocus, as it made the editor scroll to
+  // top unexpectedly–leaving that out for now
+  const isSrcNode = node?.type.name === "image" || node?.type.name === "video";
 
   const moveSelectionToEnd = useCallback(() => {
     const { state, dispatch } = view;
@@ -61,11 +60,11 @@ export function MediaLinkEditor({
     const { state, dispatch } = view;
     dispatch(state.tr.deleteSelection());
     onLinkRemove();
-  }, [view]);
+  }, [view, onLinkRemove]);
 
   const update = useCallback(() => {
     const { state } = view;
-    const hrefType = node?.type.name === "image" ? "src" : "href";
+    const hrefType = isSrcNode ? "src" : "href";
     const tr = state.tr.setNodeMarkup(state.selection.from, undefined, {
       ...node?.attrs,
       [hrefType]: localUrl,
@@ -74,7 +73,7 @@ export function MediaLinkEditor({
     view.dispatch(tr);
     moveSelectionToEnd();
     onLinkUpdate();
-  }, [localUrl, node, view, moveSelectionToEnd]);
+  }, [localUrl, node, isSrcNode, view, moveSelectionToEnd, onLinkUpdate]);
 
   useOnClickOutside(wrapperRef, onClickOutside);
 
@@ -99,7 +98,7 @@ export function MediaLinkEditor({
         }
       }
     },
-    [update, moveSelectionToEnd]
+    [update, moveSelectionToEnd, onEscape]
   );
 
   if (!node) {
@@ -109,14 +108,14 @@ export function MediaLinkEditor({
   return (
     <Wrapper ref={wrapperRef}>
       <Input
-        autoFocus={isEditingImgUrl}
+        autoFocus={isSrcNode}
         value={localUrl}
-        placeholder={dictionary.pasteLink}
+        placeholder={`${t("Paste a link")}…`}
         onChange={(e) => setLocalUrl(e.target.value)}
         onKeyDown={handleKeyDown}
         readOnly={!view.editable}
       />
-      <Tooltip content={dictionary.openLink}>
+      <Tooltip content={t("Open link")}>
         <ToolbarButton onClick={openLink} disabled={!localUrl}>
           <OpenIcon />
         </ToolbarButton>
@@ -125,8 +124,10 @@ export function MediaLinkEditor({
         <Tooltip
           content={
             node.type.name === "embed"
-              ? dictionary.deleteEmbed
-              : dictionary.deleteImage
+              ? t("Delete embed")
+              : node.type.name === "video"
+                ? t("Delete video")
+                : t("Delete image")
           }
         >
           <ToolbarButton onClick={remove}>

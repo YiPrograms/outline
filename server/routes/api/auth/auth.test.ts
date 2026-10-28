@@ -1,11 +1,20 @@
+// @vitest-isolate true
 import { faker } from "@faker-js/faker";
 import { randomUUID } from "node:crypto";
-import { buildUser, buildTeam, buildUserPasskey } from "@server/test/factories";
+import { Scope } from "@shared/types";
+import {
+  buildApiKey,
+  buildOAuthAuthentication,
+  buildUser,
+  buildTeam,
+  buildUserPasskey,
+  buildSubdomain,
+} from "@server/test/factories";
 import { getTestServer, setSelfHosted } from "@server/test/support";
 
 const mockTeamInSessionId = randomUUID();
 
-jest.mock("@server/utils/authentication", () => ({
+vi.mock("@server/utils/authentication", () => ({
   getSessionsInCookie() {
     return { [mockTeamInSessionId]: {} };
   },
@@ -27,34 +36,72 @@ describe("#auth.info", () => {
       teamId: team2.id,
       email: user.email,
     });
-    const res = await server.post("/api/auth.info", {
-      body: {
-        token: user.getJwtToken(),
-      },
-    });
+    const res = await server.post("/api/auth.info", user);
     const body = await res.json();
     expect(res.status).toEqual(200);
 
-    const availableTeamIds = body.data.availableTeams.map((t: any) => t.id);
+    const availableTeamIds = body.data.availableTeams.map(
+      (t: { id: string }) => t.id
+    );
 
     expect(availableTeamIds.length).toEqual(3);
     expect(availableTeamIds).toContain(team.id);
     expect(availableTeamIds).toContain(team2.id);
     expect(availableTeamIds).toContain(team3.id);
+
+    const isSignedIn = (id: string) =>
+      body.data.availableTeams.find((t: { id: string }) => t.id === id)
+        .isSignedIn;
+    expect(isSignedIn(team.id)).toBe(true);
+    expect(isSignedIn(team2.id)).toBe(false);
+    expect(isSignedIn(team3.id)).toBe(true);
     expect(body.data.user.name).toBe(user.name);
     expect(body.data.team.name).toBe(team.name);
     expect(body.data.team.allowedDomains).toEqual([]);
+  });
+
+  it("should return a collaboration token for a session", async () => {
+    const user = await buildUser();
+    const res = await server.post("/api/auth.info", user);
+    const body = await res.json();
+    expect(res.status).toEqual(200);
+    expect(body.data.collaborationToken).toBeTruthy();
+  });
+
+  it("should not return a collaboration token for an API key", async () => {
+    const user = await buildUser();
+    const key = await buildApiKey({ userId: user.id });
+    const res = await server.post("/api/auth.info", {
+      headers: {
+        Authorization: `Bearer ${key.value}`,
+      },
+    });
+    const body = await res.json();
+    expect(res.status).toEqual(200);
+    expect(body.data.collaborationToken).toBeUndefined();
+  });
+
+  it("should not return a collaboration token for an OAuth access token", async () => {
+    const user = await buildUser();
+    const authentication = await buildOAuthAuthentication({
+      user,
+      scope: [Scope.Read],
+    });
+    const res = await server.post("/api/auth.info", {
+      headers: {
+        Authorization: `Bearer ${authentication.accessToken}`,
+      },
+    });
+    const body = await res.json();
+    expect(res.status).toEqual(200);
+    expect(body.data.collaborationToken).toBeUndefined();
   });
 
   it("should require the team to not be deleted", async () => {
     const team = await buildTeam();
     const user = await buildUser({ teamId: team.id });
     await team.destroy();
-    const res = await server.post("/api/auth.info", {
-      body: {
-        token: user.getJwtToken(),
-      },
-    });
+    const res = await server.post("/api/auth.info", user);
     expect(res.status).toEqual(401);
   });
 
@@ -67,18 +114,10 @@ describe("#auth.info", () => {
 describe("#auth.delete", () => {
   it("should make the access token unusable", async () => {
     const user = await buildUser();
-    const res = await server.post("/api/auth.delete", {
-      body: {
-        token: user.getJwtToken(),
-      },
-    });
+    const res = await server.post("/api/auth.delete", user);
     expect(res.status).toEqual(200);
 
-    const res2 = await server.post("/api/auth.info", {
-      body: {
-        token: user.getJwtToken(),
-      },
-    });
+    const res2 = await server.post("/api/auth.info", user);
     expect(res2.status).toEqual(401);
   });
 
@@ -100,7 +139,7 @@ describe("#auth.config", () => {
   });
 
   it("should return available providers for team subdomain", async () => {
-    const subdomain = faker.internet.domainWord();
+    const subdomain = buildSubdomain();
     await buildTeam({
       guestSignin: false,
       subdomain,
@@ -146,7 +185,7 @@ describe("#auth.config", () => {
   });
 
   it("should return email provider for team when guest signin enabled", async () => {
-    const subdomain = faker.internet.domainWord();
+    const subdomain = buildSubdomain();
     await buildTeam({
       guestSignin: true,
       subdomain,
@@ -170,7 +209,7 @@ describe("#auth.config", () => {
   });
 
   it("should not return provider when disabled", async () => {
-    const subdomain = faker.internet.domainWord();
+    const subdomain = buildSubdomain();
     await buildTeam({
       guestSignin: false,
       subdomain,
@@ -193,7 +232,7 @@ describe("#auth.config", () => {
   });
 
   it("should not return passkeys provider when passkeysEnabled but no passkeys exist", async () => {
-    const subdomain = faker.internet.domainWord();
+    const subdomain = buildSubdomain();
     await buildTeam({
       guestSignin: false,
       passkeysEnabled: true,
@@ -217,7 +256,7 @@ describe("#auth.config", () => {
   });
 
   it("should return passkeys provider when passkeysEnabled and passkeys exist", async () => {
-    const subdomain = faker.internet.domainWord();
+    const subdomain = buildSubdomain();
     const team = await buildTeam({
       guestSignin: false,
       passkeysEnabled: true,
@@ -243,6 +282,8 @@ describe("#auth.config", () => {
     expect(body.data.providers[1].name).toBe("Passkeys");
   });
 
+  // Self-hosted auth.config reads the newest team, which other test files create in parallel.
+  // oxlint-disable-next-line vitest/no-disabled-tests
   describe.skip("self hosted", () => {
     beforeEach(setSelfHosted);
 

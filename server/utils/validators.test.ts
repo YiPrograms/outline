@@ -1,4 +1,3 @@
-import { describe, it, expect } from "@jest/globals";
 import { isDatabaseUrl, isMailboxAddress } from "./validators";
 
 describe("isDatabaseUrl", () => {
@@ -135,11 +134,15 @@ describe("isDatabaseUrl", () => {
     });
 
     it("should reject null", () => {
-      expect(isDatabaseUrl(null as any, defaultOptions)).toBe(false);
+      expect(isDatabaseUrl(null as unknown as string, defaultOptions)).toBe(
+        false
+      );
     });
 
     it("should reject undefined", () => {
-      expect(isDatabaseUrl(undefined as any, defaultOptions)).toBe(false);
+      expect(
+        isDatabaseUrl(undefined as unknown as string, defaultOptions)
+      ).toBe(false);
     });
 
     it("should reject URL with invalid protocol", () => {
@@ -279,18 +282,21 @@ describe("isMailboxAddress", () => {
     });
 
     it("should accept a mailbox format with quoted display name containing a comma", () => {
-      expect(
-        isMailboxAddress('"Company, Inc." <user@example.com>')
-      ).toBe(true);
+      expect(isMailboxAddress('"Company, Inc." <user@example.com>')).toBe(true);
     });
 
     it("should accept a mailbox format with a quoted display name", () => {
       expect(isMailboxAddress('"Outline" <user@example.com>')).toBe(true);
     });
 
-    it("should reject a mailbox format with an unquoted comma in the display name", () => {
-      // addressparser splits on commas, so this creates two addresses
-      expect(isMailboxAddress("Company, Inc. <user@example.com>")).toBe(false);
+    it("should accept a mailbox format with an unquoted comma in the display name", () => {
+      expect(isMailboxAddress("Company, Inc. <user@example.com>")).toBe(true);
+    });
+
+    it("should reject multiple addresses", () => {
+      expect(isMailboxAddress("user@example.com, other@example.com")).toBe(
+        false
+      );
     });
 
     it("should reject a mailbox format with an empty email address", () => {

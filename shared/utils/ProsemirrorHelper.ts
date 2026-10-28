@@ -1,8 +1,9 @@
 import type { Schema } from "prosemirror-model";
-import { Node } from "prosemirror-model";
-import headingToSlug from "../editor/lib/headingToSlug";
+import type { Node } from "prosemirror-model";
+import { HeadingSlugger } from "../editor/lib/headingToSlug";
 import textBetween from "../editor/lib/textBetween";
 import type { ProsemirrorData } from "../types";
+import { hashString } from "./string";
 import { TextHelper } from "./TextHelper";
 import env from "../env";
 import { findChildren } from "@shared/editor/queries/findChildren";
@@ -16,6 +17,8 @@ export type Heading = {
   level: number;
   /* The unique id of the heading */
   id: string;
+  /* Whether the heading is nested inside a table */
+  inTable?: boolean;
 };
 
 export type CommentMark = {
@@ -49,44 +52,42 @@ export const attachmentPublicRegex =
 
 export class ProsemirrorHelper {
   /**
-   * Get a new empty document.
+   * Remove specific mark types from all nodes in the document. Mark lists left
+   * empty are omitted, matching the schema default.
    *
-   * @returns A new empty document as JSON.
+   * @param doc the prosemirror document or JSON data.
+   * @param marks the mark type names to remove.
+   * @returns the document data with specified marks removed.
    */
-  static getEmptyDocument(): ProsemirrorData {
-    return {
-      type: "doc",
-      content: [
-        {
-          content: [],
-          type: "paragraph",
-        },
-      ],
-    };
-  }
+  static removeMarks(doc: Node | ProsemirrorData, marks: string[]) {
+    const json = "toJSON" in doc ? (doc.toJSON() as ProsemirrorData) : doc;
+    const markSet = new Set(marks);
 
-  /**
-   * Returns true if the data looks like an empty document.
-   *
-   * @param data The ProsemirrorData to check.
-   * @returns True if the document is empty.
-   */
-  static isEmptyData(data: ProsemirrorData): boolean {
-    if (data.type !== "doc") {
-      return false;
+    function removeMarksInner(node: ProsemirrorData) {
+      // Node.toJSON shares attrs with the node, so replace them rather than mutate.
+      if (node.marks) {
+        const remaining = node.marks.filter((mark) => !markSet.has(mark.type));
+        if (remaining.length) {
+          node.marks = remaining;
+        } else {
+          delete node.marks;
+        }
+      }
+      if (node.attrs?.marks) {
+        const remaining = (node.attrs.marks as { type: string }[]).filter(
+          (mark) => !markSet.has(mark.type)
+        );
+        node.attrs = {
+          ...node.attrs,
+          marks: remaining.length ? remaining : undefined,
+        };
+      }
+      if (node.content) {
+        node.content.forEach(removeMarksInner);
+      }
+      return node;
     }
-
-    if (data.content?.length === 1) {
-      const node = data.content[0];
-      return (
-        node.type === "paragraph" &&
-        (node.content === null ||
-          node.content === undefined ||
-          node.content.length === 0)
-      );
-    }
-
-    return !data.content || data.content.length === 0;
+    return removeMarksInner(json);
   }
 
   /**
@@ -121,7 +122,7 @@ export class ProsemirrorHelper {
       if (!node) {
         break;
       }
-      isEmpty = ProsemirrorHelper.toPlainText(node).trim() === "";
+      isEmpty = !ProsemirrorHelper.hasText(node);
       if (isEmpty) {
         start += node.nodeSize;
       }
@@ -134,7 +135,7 @@ export class ProsemirrorHelper {
       if (!node) {
         break;
       }
-      isEmpty = ProsemirrorHelper.toPlainText(node).trim() === "";
+      isEmpty = !ProsemirrorHelper.hasText(node);
       if (isEmpty) {
         end -= node.nodeSize;
       }
@@ -153,23 +154,7 @@ export class ProsemirrorHelper {
       return !doc || doc.textContent.trim() === "";
     }
 
-    let empty = true;
-    doc.descendants((child: Node) => {
-      // If we've already found non-empty data, we can stop descending further
-      if (!empty) {
-        return false;
-      }
-
-      if (child.type.spec.leafText) {
-        empty = !child.type.spec.leafText(child).trim();
-      } else if (child.isText) {
-        empty = !child.text?.trim();
-      }
-
-      return empty;
-    });
-
-    return empty;
+    return !ProsemirrorHelper.hasText(doc);
   }
 
   /**
@@ -191,7 +176,12 @@ export class ProsemirrorHelper {
         }
       });
 
-      (node.attrs.marks ?? []).forEach((mark: any) => {
+      (
+        (node.attrs.marks ?? []) as {
+          type: string;
+          attrs: Partial<CommentMark>;
+        }[]
+      ).forEach((mark) => {
         if (mark.type === "comment") {
           comments.push({
             ...mark.attrs,
@@ -207,45 +197,33 @@ export class ProsemirrorHelper {
     return comments;
   }
 
-  private static getAnchorsForHeadingNodes(doc: Node): NodeAnchor[] {
-    const previouslySeen: Record<string, number> = {};
-    const anchors: NodeAnchor[] = [];
+  /**
+   * Returns the anchors for headings and for nodes with comments in the
+   * document, headings first.
+   *
+   * @param doc Prosemirror document node.
+   * @returns array of anchors.
+   */
+  static getAnchors(doc: Node): NodeAnchor[] {
+    const slugger = new HeadingSlugger();
+    const headingAnchors: NodeAnchor[] = [];
+    const imageAnchors: NodeAnchor[] = [];
+
     doc.descendants((node, pos) => {
-      if (node.type.name !== "heading") {
-        return;
+      if (node.type.name === "heading") {
+        headingAnchors.push({
+          pos,
+          id: slugger.slug(node),
+          className: EditorStyleHelper.headingPositionAnchor,
+        });
       }
 
-      // calculate the optimal id
-      const slug = headingToSlug(node);
-      let id = slug;
-
-      // check if we've already used it, and if so how many times?
-      // Make the new id based on that number ensuring that we have
-      // unique ID's even when headings are identical
-      if (previouslySeen[slug] > 0) {
-        id = headingToSlug(node, previouslySeen[slug]);
-      }
-
-      // record that we've seen this slug for the next loop
-      previouslySeen[slug] =
-        previouslySeen[slug] !== undefined ? previouslySeen[slug] + 1 : 1;
-
-      anchors.push({
-        pos,
-        id,
-        className: EditorStyleHelper.headingPositionAnchor,
-      });
-    });
-    return anchors;
-  }
-
-  private static getAnchorsForImageNodes(doc: Node): NodeAnchor[] {
-    const anchors: NodeAnchor[] = [];
-    doc.descendants((node, pos) => {
       if (Array.isArray(node.attrs?.marks)) {
-        node.attrs.marks.forEach((mark: any) => {
+        (
+          node.attrs.marks as { type?: string; attrs?: { id?: string } }[]
+        ).forEach((mark) => {
           if (mark?.type === "comment" && mark?.attrs?.id) {
-            anchors.push({
+            imageAnchors.push({
               pos,
               id: `comment-${mark.attrs.id}`,
               className: EditorStyleHelper.imagePositionAnchor,
@@ -255,14 +233,77 @@ export class ProsemirrorHelper {
       }
     });
 
-    return anchors;
+    return [...headingAnchors, ...imageAnchors];
   }
 
-  static getAnchors(doc: Node): NodeAnchor[] {
-    return [
-      ...ProsemirrorHelper.getAnchorsForHeadingNodes(doc),
-      ...ProsemirrorHelper.getAnchorsForImageNodes(doc),
-    ];
+  /**
+   * Computes a stable identifier for a node derived from its type and
+   * attributes. The `marks` attribute is excluded as it changes when comments
+   * are added or removed from the node.
+   *
+   * @param node the node to compute an identifier for.
+   * @returns a hex-encoded hash identifying the node.
+   */
+  static getNodeHash(node: Node): string {
+    const { marks: _marks, ...attrs } = node.attrs;
+    const sorted = Object.keys(attrs)
+      .sort()
+      .reduce<Record<string, unknown>>((acc, key) => {
+        acc[key] = attrs[key];
+        return acc;
+      }, {});
+
+    return hashString(`${node.type.name}:${JSON.stringify(sorted)}`);
+  }
+
+  /**
+   * Finds a node in the document by the hash of its attributes, see
+   * `getNodeHash`. When multiple nodes share the same hash the first
+   * occurrence in document order is returned.
+   *
+   * @param doc Prosemirror document node.
+   * @param hash the node hash to search for.
+   * @returns the matching node and its position, or null if no match.
+   */
+  static findNodeByHash(
+    doc: Node,
+    hash: string
+  ): { node: Node; pos: number } | null {
+    let result: { node: Node; pos: number } | null = null;
+
+    doc.descendants((node, pos) => {
+      if (result) {
+        return false;
+      }
+      if (!node.isText && ProsemirrorHelper.getNodeHash(node) === hash) {
+        result = { node, pos };
+        return false;
+      }
+      return true;
+    });
+
+    return result;
+  }
+
+  /**
+   * Returns the ids of comment marks attached to the node at the given position.
+   *
+   * @param doc Prosemirror document node.
+   * @param pos Position of the node within the document.
+   * @returns array of comment ids anchored to the node.
+   */
+  static getCommentIdsAtPos(doc: Node, pos: number): string[] {
+    const node = doc.nodeAt(pos);
+    if (!node || !Array.isArray(node.attrs?.marks)) {
+      return [];
+    }
+
+    return (node.attrs.marks as { type?: string; attrs?: { id?: string } }[])
+      .filter(
+        (mark): mark is { type: "comment"; attrs: { id: string } } =>
+          mark?.type === "comment" && !!mark?.attrs?.id
+      )
+      .map((mark) => mark.attrs.id);
   }
 
   /**
@@ -326,7 +367,8 @@ export class ProsemirrorHelper {
         videos.push(node);
       }
 
-      return true;
+      // Videos are block nodes, so they are never inside a textblock.
+      return !node.isTextblock;
     });
 
     return videos;
@@ -346,7 +388,8 @@ export class ProsemirrorHelper {
         attachments.push(node);
       }
 
-      return true;
+      // Attachments are block nodes, so they are never inside a textblock.
+      return !node.isTextblock;
     });
 
     return attachments;
@@ -362,7 +405,7 @@ export class ProsemirrorHelper {
     const tasks: Task[] = [];
 
     doc.descendants((node) => {
-      if (!node.isBlock) {
+      if (!node.isBlock || node.isTextblock) {
         return false;
       }
 
@@ -400,7 +443,7 @@ export class ProsemirrorHelper {
     let total = 0;
 
     doc.descendants((node) => {
-      if (!node.isBlock) {
+      if (!node.isBlock || node.isTextblock) {
         return false;
       }
 
@@ -427,31 +470,25 @@ export class ProsemirrorHelper {
    */
   static getHeadings(doc: Node) {
     const headings: Heading[] = [];
-    const previouslySeen: Record<string, number> = {};
+    const slugger = new HeadingSlugger();
+    let tableEnd = 0;
 
-    doc.descendants((node) => {
+    doc.descendants((node, pos) => {
+      if (node.type.name === "table") {
+        // A nested table must not shrink the range of its outer table.
+        tableEnd = Math.max(tableEnd, pos + node.nodeSize);
+      }
       if (node.type.name === "heading") {
-        // calculate the optimal id
-        const id = headingToSlug(node);
-        let name = id;
-
-        // check if we've already used it, and if so how many times?
-        // Make the new id based on that number ensuring that we have
-        // unique ID's even when headings are identical
-        if (previouslySeen[id] > 0) {
-          name = headingToSlug(node, previouslySeen[id]);
-        }
-
-        // record that we've seen this id for the next loop
-        previouslySeen[id] =
-          previouslySeen[id] !== undefined ? previouslySeen[id] + 1 : 1;
-
         headings.push({
           title: ProsemirrorHelper.toPlainText(node),
           level: node.attrs.level,
-          id: name,
+          id: slugger.slug(node),
+          inTable: pos < tableEnd,
         });
       }
+
+      // Headings are never nested in a textblock.
+      return !node.isTextblock;
     });
     return headings;
   }
@@ -471,19 +508,19 @@ export class ProsemirrorHelper {
       if (
         node.type === "image" &&
         node.attrs?.src &&
-        regex.test(String(node.attrs.src))
+        regex.test(node.attrs.src as string)
       ) {
         node.attrs.src = env.URL + node.attrs.src;
       } else if (
         node.type === "video" &&
         node.attrs?.src &&
-        regex.test(String(node.attrs.src))
+        regex.test(node.attrs.src as string)
       ) {
         node.attrs.src = env.URL + node.attrs.src;
       } else if (
         node.type === "attachment" &&
         node.attrs?.href &&
-        regex.test(String(node.attrs.href))
+        regex.test(node.attrs.href as string)
       ) {
         node.attrs.href = env.URL + node.attrs.href;
       }
@@ -524,36 +561,47 @@ export class ProsemirrorHelper {
   }
 
   /**
-   * Returns the paragraphs from the data if there are only plain paragraphs
-   * without any formatting. Otherwise returns undefined.
+   * Returns true when the predicate holds for every node in the data,
+   * including the root and all descendants.
    *
-   * @param data The ProsemirrorData object or ProsemirrorNode
-   * @returns An array of paragraph nodes or undefined
+   * @param data The ProsemirrorData object to walk
+   * @param predicate The predicate to test each node against
+   * @returns true when every node passes the predicate
    */
-  static getPlainParagraphs(data: ProsemirrorData | Node) {
-    // Convert ProsemirrorNode to JSON if needed
-    const jsonData =
-      data instanceof Node ? (data.toJSON() as ProsemirrorData) : data;
-
-    const paragraphs: ProsemirrorData[] = [];
-    if (!jsonData.content) {
-      return paragraphs;
+  static everyNode(
+    data: ProsemirrorData,
+    predicate: (node: ProsemirrorData) => boolean
+  ): boolean {
+    if (!predicate(data)) {
+      return false;
     }
 
-    for (const node of jsonData.content) {
-      if (
-        node.type === "paragraph" &&
-        (!node.content ||
-          !node.content.some(
-            (item) =>
-              item.type !== "text" || (item.marks && item.marks.length > 0)
-          ))
-      ) {
-        paragraphs.push(node);
-      } else {
-        return undefined;
+    return (data.content ?? []).every(
+      (node) => !!node && ProsemirrorHelper.everyNode(node, predicate)
+    );
+  }
+
+  /**
+   * Returns true if the node contains any non-whitespace text, including the
+   * text of leaf nodes such as mentions. Stops at the first text found.
+   */
+  private static hasText(node: Node): boolean {
+    let found = false;
+
+    node.descendants((child: Node) => {
+      if (found) {
+        return false;
       }
-    }
-    return paragraphs;
+
+      if (child.type.spec.leafText) {
+        found = !!String(child.type.spec.leafText(child)).trim();
+      } else if (child.isText) {
+        found = !!child.text?.trim();
+      }
+
+      return !found;
+    });
+
+    return found;
   }
 }

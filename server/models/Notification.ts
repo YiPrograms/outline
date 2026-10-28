@@ -24,6 +24,7 @@ import { NotificationEventType } from "@shared/types";
 import { getBaseDomain } from "@shared/utils/domains";
 import env from "@server/env";
 import Model from "@server/models/base/Model";
+import { afterCommit } from "@server/storage/transaction";
 import Collection from "./Collection";
 import Comment from "./Comment";
 import Document from "./Document";
@@ -32,7 +33,7 @@ import Revision from "./Revision";
 import Team from "./Team";
 import User from "./User";
 import Group from "./Group";
-import Fix from "./decorators/Fix";
+import AccessRequest from "./AccessRequest";
 
 let baseDomain;
 
@@ -79,7 +80,8 @@ let baseDomain;
 @DefaultScope(() => ({
   include: [
     {
-      association: "document",
+      model: Document.scope(["defaultScope", "withoutStateOrText"]),
+      as: "document",
       required: false,
     },
     {
@@ -90,6 +92,14 @@ let baseDomain;
       association: "actor",
       required: false,
     },
+    {
+      association: "accessRequest",
+      required: false,
+    },
+    {
+      association: "group",
+      required: false,
+    },
   ],
 }))
 @Table({
@@ -97,7 +107,6 @@ let baseDomain;
   modelName: "notification",
   updatedAt: false,
 })
-@Fix
 class Notification extends Model<
   InferAttributes<Notification>,
   Partial<InferCreationAttributes<Notification>>
@@ -109,15 +118,15 @@ class Notification extends Model<
   id: string;
 
   @AllowNull
-  @Column
+  @Column(DataType.DATE)
   emailedAt?: Date | null;
 
   @AllowNull
-  @Column
+  @Column(DataType.DATE)
   viewedAt: Date | null;
 
   @AllowNull
-  @Column
+  @Column(DataType.DATE)
   archivedAt: Date | null;
 
   @CreatedAt
@@ -196,6 +205,14 @@ class Notification extends Model<
   @Column(DataType.UUID)
   membershipId: string;
 
+  @BelongsTo(() => AccessRequest, "accessRequestId")
+  accessRequest: AccessRequest;
+
+  @AllowNull
+  @ForeignKey(() => AccessRequest)
+  @Column(DataType.UUID)
+  accessRequestId: string;
+
   @AfterCreate
   static async createEvent(
     model: Notification,
@@ -215,7 +232,7 @@ class Notification extends Model<
     };
 
     if (options.transaction) {
-      options.transaction.afterCommit(() => void Event.schedule(params));
+      await afterCommit(options.transaction, () => void Event.schedule(params));
       return;
     }
     await Event.schedule(params);

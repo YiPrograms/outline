@@ -1,7 +1,8 @@
 import * as InputSelectPrimitive from "@radix-ui/react-select";
 import * as React from "react";
 import styled from "styled-components";
-import { depths, s } from "@shared/styles";
+import Text from "@shared/components/Text";
+import { depths, s, borderRadius } from "@shared/styles";
 import type { Props as ButtonProps } from "~/components/Button";
 import { fadeAndSlideDown, fadeAndSlideUp } from "~/styles/animations";
 import {
@@ -22,36 +23,42 @@ export type TriggerButtonProps = {
   className?: string;
 } & Pick<ButtonProps<unknown>, "borderOnHover">;
 
-type InputSelectTriggerProps = { placeholder: string } & TriggerButtonProps &
+type InputSelectTriggerProps = {
+  placeholder: string;
+  /** When provided, overrides the selected value rendered inside the trigger. */
+  displayValue?: React.ReactNode;
+  ref?: React.Ref<React.ComponentRef<typeof InputSelectPrimitive.Trigger>>;
+} & TriggerButtonProps &
   React.ComponentPropsWithoutRef<typeof InputSelectPrimitive.Trigger>;
 
-const InputSelectTrigger = React.forwardRef<
-  React.ElementRef<typeof InputSelectPrimitive.Trigger>,
-  InputSelectTriggerProps
->((props, ref) => {
-  const { placeholder, children, nude, ...buttonProps } = props;
+function InputSelectTrigger(props: InputSelectTriggerProps) {
+  const { ref, placeholder, children, nude, displayValue, ...buttonProps } =
+    props;
 
   return (
     <InputSelectPrimitive.Trigger ref={ref} asChild>
       <SelectButton neutral disclosure $nude={nude} {...buttonProps}>
-        <InputSelectPrimitive.Value placeholder={placeholder} />
+        {displayValue !== undefined ? (
+          <>{displayValue}</>
+        ) : (
+          <InputSelectPrimitive.Value placeholder={placeholder} />
+        )}
       </SelectButton>
     </InputSelectPrimitive.Trigger>
   );
-});
+}
 InputSelectTrigger.displayName = InputSelectPrimitive.Trigger.displayName;
 
 /** InputSelect's content - renders the options in a scrollable element. */
 type ContentProps = Omit<
   React.ComponentPropsWithoutRef<typeof InputSelectPrimitive.Content>,
   "position"
->;
+> & {
+  ref?: React.Ref<React.ComponentRef<typeof InputSelectPrimitive.Content>>;
+};
 
-const InputSelectContent = React.forwardRef<
-  React.ElementRef<typeof InputSelectPrimitive.Content>,
-  ContentProps
->((props, ref) => {
-  const { children, ...rest } = props;
+function InputSelectContent(props: ContentProps) {
+  const { ref, children, ...rest } = props;
 
   return (
     <InputSelectPrimitive.Portal>
@@ -62,15 +69,16 @@ const InputSelectContent = React.forwardRef<
       </StyledContent>
     </InputSelectPrimitive.Portal>
   );
-});
+}
 InputSelectContent.displayName = InputSelectPrimitive.Content.displayName;
 
 /** Individual InputSelect option rendered in the menu. */
-const InputSelectItem = React.forwardRef<
-  React.ElementRef<typeof InputSelectPrimitive.Item>,
-  React.ComponentPropsWithoutRef<typeof InputSelectPrimitive.Item>
->((props, ref) => {
-  const { children, ...rest } = props;
+function InputSelectItem(
+  props: React.ComponentPropsWithoutRef<typeof InputSelectPrimitive.Item> & {
+    ref?: React.Ref<React.ComponentRef<typeof InputSelectPrimitive.Item>>;
+  }
+) {
+  const { ref, children, ...rest } = props;
 
   return (
     <InputSelectPrimitive.Item ref={ref} {...rest} asChild>
@@ -84,22 +92,56 @@ const InputSelectItem = React.forwardRef<
       </SelectItemWrapper>
     </InputSelectPrimitive.Item>
   );
-});
+}
 InputSelectItem.displayName = InputSelectPrimitive.Item.displayName;
 
 /** Horizontal separator rendered between the options. */
-const InputSelectSeparator = React.forwardRef<
-  React.ElementRef<typeof InputSelectPrimitive.Separator>,
-  React.ComponentPropsWithoutRef<typeof InputSelectPrimitive.Separator>
->((props, ref) => (
-  <InputSelectPrimitive.Separator ref={ref} asChild>
-    <Separator {...props} />
-  </InputSelectPrimitive.Separator>
-));
+function InputSelectSeparator({
+  ref,
+  ...props
+}: React.ComponentPropsWithoutRef<typeof InputSelectPrimitive.Separator> & {
+  ref?: React.Ref<React.ComponentRef<typeof InputSelectPrimitive.Separator>>;
+}) {
+  return (
+    <InputSelectPrimitive.Separator ref={ref} asChild>
+      <Separator {...props} />
+    </InputSelectPrimitive.Separator>
+  );
+}
 InputSelectSeparator.displayName = InputSelectPrimitive.Separator.displayName;
 
 const Separator = styled.hr`
   margin: 6px 0;
+`;
+
+/** Non-selectable heading rendered to group options in the menu. */
+function InputSelectHeading({
+  ref,
+  children,
+}: {
+  children?: React.ReactNode;
+  ref?: React.Ref<HTMLSpanElement>;
+}) {
+  return (
+    <InputSelectPrimitive.Group>
+      <InputSelectPrimitive.Label asChild>
+        <Heading ref={ref}>{children}</Heading>
+      </InputSelectPrimitive.Label>
+    </InputSelectPrimitive.Group>
+  );
+}
+InputSelectHeading.displayName = "InputSelectHeading";
+
+const Heading = styled(Text).attrs({
+  type: "tertiary",
+  size: "xsmall",
+  weight: "bold",
+})`
+  display: block;
+  padding-block: 8px 4px;
+  padding-inline: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 `;
 
 /** Styled components. */
@@ -111,7 +153,7 @@ const StyledContent = styled(InputSelectPrimitive.Content)`
   max-height: 350px;
 
   padding: 4px;
-  border-radius: 6px;
+  ${borderRadius(8)}
   background: ${s("menuBackground")};
   box-shadow: ${s("menuShadow")};
   transform-origin: 50% 0;
@@ -135,4 +177,5 @@ export {
   InputSelectContent,
   InputSelectItem,
   InputSelectSeparator,
+  InputSelectHeading,
 };

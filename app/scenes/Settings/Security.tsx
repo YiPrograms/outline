@@ -1,11 +1,13 @@
-import debounce from "lodash/debounce";
+import { debounce } from "es-toolkit/compat";
 import { observer } from "mobx-react";
 import { ShieldIcon } from "outline-icons";
 import { useState } from "react";
 import * as React from "react";
 import { useTranslation, Trans } from "react-i18next";
 import { toast } from "sonner";
-import { TeamPreference, EmailDisplay } from "@shared/types";
+import { errToString } from "@shared/utils/error";
+import type { TeamPreferences, UserRole } from "@shared/types";
+import { CommentingAccess, TeamPreference, EmailDisplay } from "@shared/types";
 import ConfirmationDialog from "~/components/ConfirmationDialog";
 import Heading from "~/components/Heading";
 import type { Option } from "~/components/InputSelect";
@@ -29,7 +31,6 @@ function Security() {
     memberCollectionCreate: team.memberCollectionCreate,
     memberTeamCreate: team.memberTeamCreate,
     inviteRequired: team.inviteRequired,
-    passkeysEnabled: team.passkeysEnabled,
   });
 
   const userRoleOptions: Option[] = React.useMemo(
@@ -71,6 +72,28 @@ function Security() {
     [t]
   );
 
+  const commentingOptions: Option[] = React.useMemo(
+    () =>
+      [
+        {
+          type: "item",
+          label: t("Members"),
+          value: CommentingAccess.Members,
+        },
+        {
+          type: "item",
+          label: t("Members and guests"),
+          value: CommentingAccess.Everyone,
+        },
+        {
+          type: "item",
+          label: t("No one"),
+          value: CommentingAccess.None,
+        },
+      ] satisfies Option[],
+    [t]
+  );
+
   const showSuccessMessage = React.useMemo(
     () =>
       debounce(() => {
@@ -80,13 +103,15 @@ function Security() {
   );
 
   const saveData = React.useCallback(
-    async (newData) => {
+    async (
+      newData: Partial<typeof data> & { preferences?: TeamPreferences }
+    ) => {
       try {
         setData((prev) => ({ ...prev, ...newData }));
         await team.save(newData);
         showSuccessMessage();
       } catch (err) {
-        toast.error(err.message);
+        toast.error(errToString(err));
       }
     },
     [team, showSuccessMessage]
@@ -94,7 +119,7 @@ function Security() {
 
   const handleDefaultRoleChange = React.useCallback(
     async (newDefaultRole: string) => {
-      await saveData({ defaultUserRole: newDefaultRole });
+      await saveData({ defaultUserRole: newDefaultRole as UserRole });
     },
     [saveData]
   );
@@ -102,13 +127,6 @@ function Security() {
   const handleSharingChange = React.useCallback(
     async (checked: boolean) => {
       await saveData({ sharing: checked });
-    },
-    [saveData]
-  );
-
-  const handlePasskeysEnabledChange = React.useCallback(
-    async (checked: boolean) => {
-      await saveData({ passkeysEnabled: checked });
     },
     [saveData]
   );
@@ -132,6 +150,17 @@ function Security() {
       const preferences = {
         ...team.preferences,
         [TeamPreference.MembersCanInvite]: checked,
+      };
+      await saveData({ preferences });
+    },
+    [saveData, team.preferences]
+  );
+
+  const handlePersonalDocsChange = React.useCallback(
+    async (checked: boolean) => {
+      const preferences = {
+        ...team.preferences,
+        [TeamPreference.PersonalDocs]: checked,
       };
       await saveData({ preferences });
     },
@@ -164,7 +193,18 @@ function Security() {
     async (emailDisplay: string) => {
       const preferences = {
         ...team.preferences,
-        [TeamPreference.EmailDisplay]: emailDisplay,
+        [TeamPreference.EmailDisplay]: emailDisplay as EmailDisplay,
+      };
+      await saveData({ preferences });
+    },
+    [saveData, team.preferences]
+  );
+
+  const handleCommentingChange = React.useCallback(
+    async (commenting: string) => {
+      const preferences = {
+        ...team.preferences,
+        [TeamPreference.Commenting]: commenting as CommentingAccess,
       };
       await saveData({ preferences });
     },
@@ -258,26 +298,11 @@ function Security() {
             options={userRoleOptions}
             onChange={handleDefaultRoleChange}
             label={t("Default role")}
-            hideLabel
+            labelHidden
             short
           />
         </SettingRow>
       )}
-
-      <Heading as="h2">{t("Authentication")}</Heading>
-      <SettingRow
-        label={t("Passkeys")}
-        name="passkeysEnabled"
-        description={t(
-          "Allow users to sign in with passkeys for passwordless authentication"
-        )}
-      >
-        <Switch
-          id="passkeysEnabled"
-          checked={data.passkeysEnabled}
-          onChange={handlePasskeysEnabledChange}
-        />
-      </SettingRow>
 
       <Heading as="h2">{t("Behavior")}</Heading>
       <SettingRow
@@ -331,8 +356,38 @@ function Security() {
           options={emailDisplayOptions}
           onChange={handleEmailDisplayChange}
           label={t("Email address visibility")}
-          hideLabel
+          labelHidden
           short
+        />
+      </SettingRow>
+      <SettingRow
+        label={t("Commenting")}
+        name={TeamPreference.Commenting}
+        description={t("Controls who can add comments to documents")}
+      >
+        <InputSelect
+          value={
+            team.getPreference(TeamPreference.Commenting) ||
+            CommentingAccess.Members
+          }
+          options={commentingOptions}
+          onChange={handleCommentingChange}
+          label={t("Commenting")}
+          labelHidden
+          short
+        />
+      </SettingRow>
+      <SettingRow
+        label={t("Personal documents")}
+        name={TeamPreference.PersonalDocs}
+        description={t(
+          "Allow editors to create personal documents that are only visible to themselves and the people they share them with"
+        )}
+      >
+        <Switch
+          id={TeamPreference.PersonalDocs}
+          checked={team.getPreference(TeamPreference.PersonalDocs)}
+          onChange={handlePersonalDocsChange}
         />
       </SettingRow>
       <SettingRow

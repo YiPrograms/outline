@@ -1,16 +1,20 @@
-import Router from "koa-router";
+import Router from "@koa/router";
+import { randomUUID } from "node:crypto";
+import { truncate } from "es-toolkit/compat";
 import type { WhereOptions } from "sequelize";
 import { Sequelize, Op } from "sequelize";
+import type { Filter } from "@shared/helpers/FilterHelper";
 import {
   CollectionPermission,
   CollectionStatusFilter,
-  FileOperationState,
-  FileOperationType,
+  FileOperationFormat,
+  ImportState,
+  IntegrationService,
   UserRole,
 } from "@shared/types";
-import collectionExporter from "@server/commands/collectionExporter";
+import { ImportValidation } from "@shared/validations";
+import collectionDuplicator from "@server/commands/collectionDuplicator";
 import teamUpdater from "@server/commands/teamUpdater";
-import { parser } from "@server/editor";
 import auth from "@server/middlewares/authentication";
 import { rateLimiter } from "@server/middlewares/rateLimiter";
 import { transaction } from "@server/middlewares/transaction";
@@ -23,10 +27,15 @@ import {
   User,
   Group,
   Attachment,
-  FileOperation,
   Document,
+  Import,
+  FileOperation,
 } from "@server/models";
-import { DocumentHelper } from "@server/models/helpers/DocumentHelper";
+import {
+  buildWhere,
+  combineFilters,
+  hasFieldInFilter,
+} from "@server/models/helpers/Filters";
 import { authorize } from "@server/policies";
 import {
   presentCollection,
@@ -38,10 +47,9 @@ import {
   presentFileOperation,
 } from "@server/presenters";
 import type { APIContext } from "@server/types";
-import { CacheHelper } from "@server/utils/CacheHelper";
-import { RedisPrefixHelper } from "@server/utils/RedisPrefixHelper";
 import { RateLimiterStrategy } from "@server/utils/RateLimiter";
 import { collectionIndexing } from "@server/utils/indexing";
+import { QueryHelper } from "@server/storage/QueryHelper";
 import pagination from "../middlewares/pagination";
 import * as T from "./schema";
 import { InvalidRequestError } from "@server/errors";
@@ -50,6 +58,7 @@ const router = new Router();
 
 router.post(
   "collections.create",
+  rateLimiter(RateLimiterStrategy.TwentyFivePerMinute),
   auth(),
   validate(T.CollectionsCreateSchema),
   transaction(),
@@ -88,12 +97,6 @@ router.post(
       templateManagement,
     });
 
-    if (data) {
-      collection.description = await DocumentHelper.toMarkdown(collection, {
-        includeTitle: false,
-      });
-    }
-
     await collection.saveWithCtx(ctx);
 
     // we must reload the collection to get memberships for policy presenter
@@ -106,6 +109,36 @@ router.post(
     ctx.body = {
       data: await presentCollection(ctx, reloaded),
       policies: presentPolicies(user, [reloaded]),
+    };
+  }
+);
+
+router.post(
+  "collections.duplicate",
+  rateLimiter(RateLimiterStrategy.TwentyFivePerMinute),
+  auth(),
+  validate(T.CollectionsDuplicateSchema),
+  transaction(),
+  async (ctx: APIContext<T.CollectionsDuplicateReq>) => {
+    const { transaction } = ctx.state;
+    const { id, name } = ctx.input.body;
+    const { user } = ctx.state.auth;
+
+    const collection = await Collection.findByPk(id, {
+      userId: user.id,
+      transaction,
+      rejectOnEmpty: true,
+    });
+    authorize(user, "duplicate", collection);
+
+    const duplicated = await collectionDuplicator(ctx, {
+      collection,
+      name,
+    });
+
+    ctx.body = {
+      data: await presentCollection(ctx, duplicated),
+      policies: presentPolicies(user, [duplicated]),
     };
   }
 );
@@ -145,18 +178,7 @@ router.post(
 
     authorize(user, "readDocument", collection);
 
-    const documentStructure = await CacheHelper.getDataOrSet(
-      RedisPrefixHelper.getCollectionDocumentsKey(collection.id),
-      async () =>
-        (
-          await Collection.findByPk(collection.id, {
-            attributes: ["documentStructure"],
-            includeDocumentStructure: true,
-            rejectOnEmpty: true,
-          })
-        ).documentStructure,
-      60
-    );
+    const documentStructure = await collection.getCachedDocumentStructure();
 
     ctx.body = {
       data: documentStructure || [],
@@ -181,17 +203,27 @@ router.post(
     });
     authorize(user, "read", attachment);
 
-    await FileOperation.createWithCtx(ctx, {
-      type: FileOperationType.Import,
-      state: FileOperationState.Creating,
-      format,
-      size: attachment.size,
-      key: attachment.key,
-      userId: user.id,
+    const service =
+      format === FileOperationFormat.MarkdownZip
+        ? IntegrationService.Markdown
+        : IntegrationService.JSON;
+
+    await Import.createWithCtx(ctx, {
+      name: truncate(attachment.name, {
+        length: ImportValidation.maxNameLength,
+      }),
+      service,
+      state: ImportState.Created,
+      input: [
+        {
+          externalId: randomUUID(),
+          permission: permission ?? undefined,
+        },
+      ],
+      scratch: { storageKey: attachment.key },
+      integrationId: null,
+      createdById: user.id,
       teamId: user.teamId,
-      options: {
-        permission,
-      },
     });
 
     ctx.body = {
@@ -214,27 +246,25 @@ router.post(
       Collection.findByPk(id, { userId: user.id, transaction }),
       Group.findByPk(groupId, { transaction }),
     ]);
-    authorize(user, "update", collection);
+    authorize(user, "manageUsers", collection);
     authorize(user, "read", group);
 
-    let membership = await GroupMembership.findOne({
-      where: {
-        collectionId: id,
-        groupId,
-      },
-      lock: transaction.LOCK.UPDATE,
-      ...ctx.context,
-    });
+    let membership = await GroupMembership.findOneForUpdate(
+      { collectionId: id, groupId },
+      { transaction }
+    );
 
     if (membership) {
-      membership.permission = permission;
-      await membership.save(ctx.context);
+      if (permission !== undefined) {
+        membership.permission = permission;
+        await membership.save(ctx.context);
+      }
     } else {
       membership = await GroupMembership.create(
         {
           collectionId: id,
           groupId,
-          permission,
+          permission: permission ?? CollectionPermission.ReadWrite,
           createdById: user.id,
         },
         ctx.context
@@ -270,7 +300,7 @@ router.post(
         transaction,
       }),
     ]);
-    authorize(user, "update", collection);
+    authorize(user, "manageUsers", collection);
     authorize(user, "read", group);
 
     const [membership] = await collection.$get("groupMemberships", {
@@ -280,7 +310,7 @@ router.post(
 
     if (!membership) {
       ctx.throw(
-        InvalidRequestError("This Group is not a part of the collection")
+        InvalidRequestError("This group is not a part of the collection")
       );
     }
 
@@ -313,9 +343,7 @@ router.post(
 
     if (query) {
       groupWhere = {
-        name: {
-          [Op.iLike]: `%${query}%`,
-        },
+        name: { [Op.iLike]: QueryHelper.likeContains(query) },
       };
     }
 
@@ -374,21 +402,19 @@ router.post(
       Collection.findByPk(id, { userId: actor.id, transaction }),
       User.findByPk(userId, { transaction }),
     ]);
-    authorize(actor, "update", collection);
+    authorize(actor, "manageUsers", collection);
     authorize(actor, "read", user);
 
-    let membership = await UserMembership.findOne({
-      where: {
-        collectionId: id,
-        userId,
-      },
-      lock: transaction.LOCK.UPDATE,
-      ...ctx.context,
-    });
+    let membership = await UserMembership.findOneForUpdate(
+      { collectionId: id, userId },
+      { transaction }
+    );
 
     if (membership) {
-      membership.permission = permission || user.defaultCollectionPermission;
-      await membership.save(ctx.context);
+      if (permission !== undefined) {
+        membership.permission = permission;
+        await membership.save(ctx.context);
+      }
     } else {
       membership = await UserMembership.create(
         {
@@ -424,7 +450,7 @@ router.post(
       Collection.findByPk(id, { userId: actor.id, transaction }),
       User.findByPk(userId, { transaction }),
     ]);
-    authorize(actor, "update", collection);
+    authorize(actor, "manageUsers", collection);
     authorize(actor, "read", user);
 
     const [membership] = await collection.$get("memberships", {
@@ -464,9 +490,7 @@ router.post(
 
     if (query) {
       userWhere = {
-        name: {
-          [Op.iLike]: `%${query}%`,
-        },
+        name: { [Op.iLike]: QueryHelper.likeContains(query) },
       };
     }
 
@@ -524,13 +548,11 @@ router.post(
     });
     authorize(user, "export", collection);
 
-    const fileOperation = await collectionExporter({
+    const fileOperation = await FileOperation.createExport(ctx, {
       collection,
       team,
-      user,
       format,
       includeAttachments,
-      ctx,
     });
 
     ctx.body = {
@@ -555,13 +577,11 @@ router.post(
     const team = await Team.findByPk(user.teamId, { transaction });
     authorize(user, "createExport", team);
 
-    const fileOperation = await collectionExporter({
-      user,
+    const fileOperation = await FileOperation.createExport(ctx, {
       team,
       format,
       includeAttachments,
       includePrivate,
-      ctx,
     });
 
     ctx.body = {
@@ -592,28 +612,48 @@ router.post(
       sharing,
       commenting,
       templateManagement,
+      deprecatedReason,
     } = ctx.input.body;
+
+    const updatingDeprecatedReason =
+      deprecatedReason !== undefined &&
+      Object.keys(ctx.input.body).every(
+        (key) => key === "id" || key === "deprecatedReason"
+      );
 
     const { user } = ctx.state.auth;
     const collection = await Collection.findByPk(id, {
       userId: user.id,
+      includeArchivedBy: updatingDeprecatedReason,
       transaction,
     });
-    authorize(user, "update", collection);
+    authorize(
+      user,
+      updatingDeprecatedReason ? "updateDeprecatedReason" : "update",
+      collection
+    );
+
+    if (deprecatedReason !== undefined) {
+      authorize(user, "updateDeprecatedReason", collection);
+      await collection.updateDeprecatedReason(ctx, deprecatedReason);
+      ctx.body = {
+        data: await presentCollection(ctx, collection),
+        policies: presentPolicies(user, [collection]),
+      };
+      return;
+    }
 
     // we're making this collection have no default access, ensure that the
     // current user has an admin membership so that at least they can manage it.
     if (
+      permission !== undefined &&
       permission !== CollectionPermission.ReadWrite &&
       collection.permission === CollectionPermission.ReadWrite
     ) {
-      let membership = await UserMembership.findOne({
-        where: {
-          collectionId: collection.id,
-          userId: user.id,
-        },
-        transaction,
-      });
+      const membership = await UserMembership.findOneForUpdate(
+        { collectionId: collection.id, userId: user.id },
+        { transaction }
+      );
 
       if (!membership) {
         await UserMembership.create(
@@ -631,56 +671,21 @@ router.post(
       }
     }
 
-    let privacyChanged = false;
-    let sharingChanged = false;
+    collection.fill({
+      name: name?.trim(),
+      description,
+      content: data,
+      icon,
+      color,
+      permission,
+      sharing,
+      sort,
+      commenting,
+      templateManagement,
+    });
 
-    if (name !== undefined) {
-      collection.name = name.trim();
-    }
-
-    if (description !== undefined) {
-      collection.description = description;
-      collection.content = description
-        ? parser.parse(description)?.toJSON()
-        : null;
-    }
-
-    if (data !== undefined) {
-      collection.content = data;
-      collection.description = await DocumentHelper.toMarkdown(collection, {
-        includeTitle: false,
-      });
-    }
-
-    if (icon !== undefined) {
-      collection.icon = icon;
-    }
-
-    if (color !== undefined) {
-      collection.color = color;
-    }
-
-    if (permission !== undefined) {
-      privacyChanged = permission !== collection.permission;
-      collection.permission = permission ? permission : null;
-    }
-
-    if (sharing !== undefined) {
-      sharingChanged = sharing !== collection.sharing;
-      collection.sharing = sharing;
-    }
-
-    if (sort !== undefined) {
-      collection.sort = sort;
-    }
-
-    if (commenting !== undefined) {
-      collection.commenting = commenting;
-    }
-
-    if (templateManagement !== undefined) {
-      collection.templateManagement = templateManagement;
-    }
+    const privacyChanged = collection.changed("permission");
+    const sharingChanged = collection.changed("sharing");
 
     await collection.saveWithCtx(ctx);
 
@@ -719,7 +724,12 @@ router.post(
   pagination(),
   transaction(),
   async (ctx: APIContext<T.CollectionsListReq>) => {
-    const { includeListOnly, query, statusFilter } = ctx.input.body;
+    const {
+      includeListOnly,
+      query,
+      statusFilter,
+      filters: rawFilters,
+    } = ctx.input.body;
     const { user } = ctx.state.auth;
     const { transaction } = ctx.state;
     const collectionIds = await user.collectionIds({ transaction });
@@ -737,52 +747,50 @@ router.post(
       ],
     };
 
-    if (!statusFilter) {
+    // The schema rejects callers that combine `filters` with the deprecated
+    // top-level params, so at most one of the two shapes is set.
+    const legacyLeaves: Filter[] = [];
+    if (query) {
+      legacyLeaves.push({ field: "name", operator: "contains", value: query });
+    }
+    if (statusFilter?.includes(CollectionStatusFilter.Archived)) {
+      legacyLeaves.push({ field: "archivedAt", operator: "isNotNull" });
+    }
+    const filter = combineFilters(rawFilters ?? legacyLeaves);
+
+    // Results can contain archived collections once the caller targets
+    // archivedAt themselves, so hydrate the archiving user for presentation.
+    const includeArchived =
+      filter !== undefined && hasFieldInFilter(filter, "archivedAt");
+
+    // Exclude archived collections unless the caller targets archivedAt.
+    if (statusFilter === undefined && !includeArchived) {
       where[Op.and].push({ archivedAt: { [Op.eq]: null } });
     }
 
-    if (!includeListOnly || !user.isAdmin) {
+    // Admins can restore any archived collection, including private ones they
+    // are not a member of, so they must be able to see them listed.
+    if (!user.isAdmin || !(includeListOnly || includeArchived)) {
       where[Op.and].push({ id: collectionIds });
-    }
-
-    if (query) {
-      where[Op.and].push(
-        Sequelize.literal(`unaccent(LOWER(name)) like unaccent(LOWER(:query))`)
-      );
-    }
-
-    const statusQuery = [];
-    if (statusFilter?.includes(CollectionStatusFilter.Archived)) {
-      statusQuery.push({
-        archivedAt: {
-          [Op.ne]: null,
-        },
-      });
-    }
-
-    if (statusQuery.length) {
+    } else {
       where[Op.and].push({
-        [Op.or]: statusQuery,
+        ownerId: { [Op.or]: [{ [Op.is]: null }, { [Op.eq]: user.id }] },
       });
     }
 
-    const replacements = { query: `%${query}%` };
+    if (filter) {
+      where[Op.and].push(buildWhere<Collection>(filter));
+    }
 
     const [collections, total] = await Promise.all([
-      Collection.scope(
-        statusFilter?.includes(CollectionStatusFilter.Archived)
-          ? [
-              {
-                method: ["withMembership", user.id],
-              },
-              "withArchivedBy",
-            ]
-          : {
-              method: ["withMembership", user.id],
-            }
-      ).findAll({
+      Collection.scope([
+        // Named scopes replace the default scope, so it must be applied
+        // explicitly to keep the documentStructure column out of the result.
+        "defaultScope",
+        { method: ["withMembership", user.id] },
+        ...(includeArchived ? ["withArchivedBy"] : []),
+      ]).findAll({
         where,
-        replacements,
         order: [
           Sequelize.literal('"collection"."index" collate "C"'),
           ["updatedAt", "DESC"],
@@ -793,8 +801,6 @@ router.post(
       }),
       Collection.count({
         where,
-        // @ts-expect-error Types are incorrect for count
-        replacements,
         transaction,
       }),
     ]);
@@ -829,7 +835,7 @@ router.post(
   transaction(),
   async (ctx: APIContext<T.CollectionsDeleteReq>) => {
     const { transaction } = ctx.state;
-    const { id } = ctx.input.body;
+    const { id, reason } = ctx.input.body;
     const { user } = ctx.state.auth;
 
     const collection = await Collection.findByPk(id, {
@@ -838,6 +844,10 @@ router.post(
     });
 
     authorize(user, "delete", collection);
+
+    if (reason !== undefined) {
+      collection.deprecatedReason = reason || null;
+    }
 
     await collection.destroyWithCtx(ctx);
 
@@ -854,7 +864,7 @@ router.post(
   transaction(),
   async (ctx: APIContext<T.CollectionsArchiveReq>) => {
     const { transaction } = ctx.state;
-    const { id } = ctx.input.body;
+    const { id, reason } = ctx.input.body;
     const { user } = ctx.state.auth;
 
     const collection = await Collection.findByPk(id, {
@@ -865,31 +875,11 @@ router.post(
 
     authorize(user, "archive", collection);
 
-    collection.archivedAt = new Date();
-    collection.archivedById = user.id;
-    collection.archivedBy = user;
+    if (reason !== undefined) {
+      collection.deprecatedReason = reason || null;
+    }
 
-    await collection.saveWithCtx(ctx, undefined, {
-      name: "archive",
-    });
-
-    // Archive all documents within the collection
-    await Document.update(
-      {
-        lastModifiedById: user.id,
-        archivedAt: collection.archivedAt,
-      },
-      {
-        where: {
-          teamId: collection.teamId,
-          collectionId: collection.id,
-          archivedAt: {
-            [Op.is]: null,
-          },
-        },
-        transaction,
-      }
-    );
+    await collection.archiveWithCtx(ctx);
 
     ctx.body = {
       data: await presentCollection(ctx, collection),
@@ -921,6 +911,7 @@ router.post(
       {
         lastModifiedById: user.id,
         archivedAt: null,
+        deprecatedReason: null,
       },
       {
         where: {
@@ -934,6 +925,8 @@ router.post(
 
     collection.archivedAt = null;
     collection.archivedById = null;
+    collection.deprecatedReason = null;
+    collection.changed("deprecatedReason", true);
     collection = await collection.saveWithCtx(ctx, undefined, {
       name: "restore",
     });
@@ -957,7 +950,7 @@ router.post(
 
     let collection = await Collection.findByPk(id, {
       transaction,
-      lock: transaction.LOCK.UPDATE,
+      lock: transaction.LOCK.NO_KEY_UPDATE,
     });
     authorize(user, "move", collection);
 

@@ -1,18 +1,18 @@
 import isEqual from "fast-deep-equal";
-import isArray from "lodash/isArray";
-import isObject from "lodash/isObject";
-import pick from "lodash/pick";
+import { isUndefined, omitBy } from "es-toolkit";
+import { isArray, isObject, pick } from "es-toolkit/compat";
 import type {
   Attributes,
   CreateOptions,
   CreationAttributes,
+  DestroyOptions,
   FindOptions,
   FindOrCreateOptions,
   ModelStatic,
   NonAttribute,
   SaveOptions,
 } from "sequelize";
-import { DataTypes, UniqueConstraintError } from "sequelize";
+import { DataTypes, Op, UniqueConstraintError } from "sequelize";
 import {
   AfterCreate,
   AfterDestroy,
@@ -24,10 +24,11 @@ import {
 } from "sequelize-typescript";
 import Logger from "@server/logging/Logger";
 import type { Replace, APIContext } from "@server/types";
-import { getChangsetSkipped } from "../decorators/Changeset";
+import { getChangesetSkipped } from "../decorators/Changeset";
 import { InternalError } from "@server/errors";
+import { afterCommit } from "@server/storage/transaction";
 
-type EventOverrideOptions = {
+export type EventOverrideOptions = {
   /** Override the default event name. */
   name?: string;
   /** Additional data to publish in the event. */
@@ -48,9 +49,17 @@ type EventOptions = EventOverrideOptions & {
 export type HookContext = APIContext["context"] & { event?: EventOptions };
 
 class Model<
+  // oxlint-disable-next-line @typescript-eslint/no-explicit-any -- Sequelize's Attributes<M> resolves to never under object default; load-bearing for static helpers like saveWithCtx<M extends Model>.
   TModelAttributes extends object = any,
   TCreationAttributes extends object = TModelAttributes,
 > extends SequelizeModel<TModelAttributes, TCreationAttributes> {
+  /**
+   * Disables Sequelize's public class field detection, which reports a false positive for the
+   * per-instance accessors that sequelize-strict-attributes installs on attributes omitted from
+   * a query's selection.
+   */
+  static _overwrittenAttributesChecked = true;
+
   /**
    * The namespace to use for events - defaults to the table name if none is provided.
    */
@@ -75,7 +84,7 @@ class Model<
   }
 
   /**
-   * This is the same as calling `set` and then calling `save`.
+   * This is the same as calling `fill` and then calling `save`.
    */
   public updateWithCtx(
     ctx: APIContext,
@@ -89,8 +98,19 @@ class Model<
         publish: true,
       },
     };
-    this.set(keys);
+    this.fill(keys);
     return this.save(hookContext);
+  }
+
+  /**
+   * Sets the given attributes on the instance, skipping any with an undefined
+   * value. Use `null` to clear an attribute.
+   *
+   * @param keys the attributes to set.
+   * @returns the instance.
+   */
+  public fill(keys: Partial<TModelAttributes>) {
+    return this.set(omitBy(keys, isUndefined));
   }
 
   /**
@@ -159,7 +179,11 @@ class Model<
     // Record not found, try to create it
     try {
       const created = await this.create(
-        { ...options.defaults, ...options.where } as CreationAttributes<M>,
+        Object.assign(
+          {},
+          options.defaults,
+          options.where
+        ) as CreationAttributes<M>,
         { ...hookContext, transaction }
       );
       return [created as M, true];
@@ -175,6 +199,34 @@ class Model<
       }
       throw err;
     }
+  }
+
+  /**
+   * Destroys every row that matches the given options, publishing an event for
+   * each. Rows are matched when the destroy runs, so rows written after the
+   * options were prepared are destroyed too.
+   *
+   * @param ctx The API context.
+   * @param options The destroy options.
+   * @param eventOpts Optional event override options.
+   * @returns the number of destroyed rows.
+   */
+  public static destroyWithCtx<M extends Model>(
+    this: ModelStatic<M>,
+    ctx: APIContext,
+    options: DestroyOptions<Attributes<M>>,
+    eventOpts?: EventOverrideOptions
+  ) {
+    const hookContext = {
+      ...ctx.context,
+      ...options,
+      individualHooks: true,
+      event: {
+        ...eventOpts,
+        publish: true,
+      },
+    };
+    return this.destroy(hookContext);
   }
 
   /**
@@ -280,33 +332,58 @@ class Model<
       );
     }
 
+    const collectionId =
+      "collectionId" in model
+        ? model.collectionId
+        : model instanceof models.collection
+          ? model.id
+          : undefined;
+
+    const documentId =
+      "documentId" in model
+        ? model.documentId
+        : model instanceof models.document
+          ? model.id
+          : undefined;
+
+    let teamId =
+      "teamId" in model
+        ? model.teamId
+        : model instanceof models.team
+          ? model.id
+          : context.auth?.user?.teamId;
+
+    // Membership-style models (e.g. UserMembership, GroupMembership) carry no
+    // teamId of their own, so derive it from the associated document or
+    // collection when the mutating context has no authenticated team. This
+    // guarantees events are never persisted without a team.
+    if (!teamId && (documentId || collectionId)) {
+      const parent = documentId
+        ? await models.document.unscoped().findByPk(documentId, {
+            attributes: ["teamId"],
+            paranoid: false,
+            transaction: context.transaction,
+          })
+        : await models.collection.unscoped().findByPk(collectionId, {
+            attributes: ["teamId"],
+            paranoid: false,
+            transaction: context.transaction,
+          });
+      teamId = parent?.getDataValue("teamId") ?? teamId;
+    }
+
     const attrs = {
       name: `${namespace}.${context.event.name ?? name}`,
       modelId: "modelId" in model ? model.modelId : model.id,
-      collectionId:
-        "collectionId" in model
-          ? model.collectionId
-          : model instanceof models.collection
-            ? model.id
-            : undefined,
-      documentId:
-        "documentId" in model
-          ? model.documentId
-          : model instanceof models.document
-            ? model.id
-            : undefined,
+      collectionId,
+      documentId,
       userId:
         "userId" in model
           ? model.userId
           : model instanceof models.user
             ? model.id
             : undefined,
-      teamId:
-        "teamId" in model
-          ? model.teamId
-          : model instanceof models.team
-            ? model.id
-            : context.auth?.user.teamId,
+      teamId,
       actorId:
         context.auth?.user?.id ??
         (model instanceof models.user && name === "create"
@@ -322,15 +399,12 @@ class Model<
       return models.event.create(attrs, {
         transaction: context.transaction,
       });
-    } else if (context.transaction) {
-      (context.transaction.parent || context.transaction).afterCommit(() =>
-        // @ts-expect-error Event class
-        models.event.schedule(attrs)
-      );
-    } else {
-      // @ts-expect-error Event class
-      return models.event.schedule(attrs);
     }
+
+    return afterCommit(context.transaction, () =>
+      // @ts-expect-error Event class
+      models.event.schedule(attrs)
+    );
   }
 
   /**
@@ -341,31 +415,85 @@ class Model<
    * @return The total number of results processed.
    */
   static async findAllInBatches<T extends Model>(
-    query: Replace<FindOptions<T>, "limit", "batchLimit"> & {
+    this: ModelStatic<T>,
+    query: Omit<Replace<FindOptions<T>, "limit", "batchLimit">, "order"> & {
       /** The maximum number of results to return, after which the query will stop. */
       totalLimit?: number;
+      /** The order of results, as plain [column, direction] pairs. */
+      order?: Array<[string, "ASC" | "DESC"]>;
     },
     callback: (results: Array<T>, query: FindOptions<T>) => Promise<void>
   ): Promise<number> {
-    let total = 0;
-    const mappedQuery = {
-      ...query,
-      offset: query.offset ?? 0,
-      limit: query.batchLimit ?? 10,
-    };
+    const { batchLimit = 10, totalLimit = Infinity, offset, ...rest } = query;
 
-    let results;
+    // A raw query with an explicit order is trusted to be unique (it may
+    // select aggregates where the primary key is unavailable), otherwise
+    // append the primary key column(s) to guarantee a total, stable order.
+    const order = [...(rest.order ?? [])];
+    if (!rest.raw || order.length === 0) {
+      for (const pk of this.primaryKeyAttributes) {
+        if (!order.some(([column]) => column === pk)) {
+          order.push([pk, "ASC"]);
+        }
+      }
+    }
+
+    // The cursor columns must be selected for their values to be read back,
+    // so add any missing ones when the caller restricts attributes.
+    let attributes = rest.attributes;
+    if (
+      Array.isArray(attributes) &&
+      attributes.every((attr): attr is string => typeof attr === "string")
+    ) {
+      attributes = [
+        ...new Set([...attributes, ...order.map(([column]) => column)]),
+      ];
+    }
+
+    const cursorValue = (row: T, column: string) =>
+      typeof row.get === "function"
+        ? row.get(column)
+        : (row as Record<string, unknown>)[column];
+
+    const buildCursor = (lastRow: T) => ({
+      [Op.or]: order.map(([column, direction], index) => {
+        const clause: Record<string, unknown> = {};
+        for (const [prevColumn] of order.slice(0, index)) {
+          clause[prevColumn] = { [Op.eq]: cursorValue(lastRow, prevColumn) };
+        }
+        clause[column] = {
+          [direction === "DESC" ? Op.lt : Op.gt]: cursorValue(lastRow, column),
+        };
+        return clause;
+      }),
+    });
+
+    let cursor: ReturnType<typeof buildCursor> | undefined;
+    let currentOffset = offset ?? 0;
+    let total = 0;
+    let limit: number;
+    let results: T[];
 
     do {
-      // @ts-expect-error this T
-      results = await this.findAll<T>(mappedQuery);
+      limit = Math.min(batchLimit, totalLimit - total);
+      const findOptions: FindOptions<T> = {
+        ...rest,
+        attributes,
+        order,
+        limit,
+        offset: currentOffset,
+        where: cursor ? { [Op.and]: [rest.where ?? {}, cursor] } : rest.where,
+      };
+      results = await this.findAll<T>(findOptions);
       total += results.length;
-      await callback(results, mappedQuery);
-      mappedQuery.offset += mappedQuery.limit;
-    } while (
-      results.length >= mappedQuery.limit &&
-      (mappedQuery.totalLimit ?? Infinity) > mappedQuery.offset
-    );
+      await callback(results, findOptions);
+
+      if (results.length > 0) {
+        cursor = buildCursor(results[results.length - 1]);
+      }
+      // The cursor supersedes offset-based pagination after the first batch.
+      currentOffset = 0;
+    } while (results.length >= limit && total < totalLimit);
 
     return total;
   }
@@ -392,7 +520,7 @@ class Model<
 
     const virtualFields = (this.constructor as typeof Model).virtualFields;
     const blobFields = (this.constructor as typeof Model).blobFields;
-    const skippedFields = getChangsetSkipped(this);
+    const skippedFields = getChangesetSkipped(this);
 
     for (const change of changes) {
       const previous = this.previous(change);
@@ -414,8 +542,10 @@ class Model<
       ) {
         const difference = Object.keys(previous)
           .concat(Object.keys(current))
-          // @ts-expect-error TODO
-          .filter((key) => !isEqual(previous[key], current[key]));
+          .filter(
+            (key) =>
+              !isEqual(Reflect.get(previous, key), Reflect.get(current, key))
+          );
 
         previousAttributes[change] = pick(
           previous,

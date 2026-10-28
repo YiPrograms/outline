@@ -10,11 +10,7 @@ import type RootStore from "~/stores/RootStore";
 import type { SidebarContextType } from "./components/Sidebar/components/SidebarContext";
 import type Model from "./models/base/Model";
 import type Document from "./models/Document";
-import type FileOperation from "./models/FileOperation";
-import type Pin from "./models/Pin";
-import type Star from "./models/Star";
 import type User from "./models/User";
-import type UserMembership from "./models/UserMembership";
 import type Policy from "./models/Policy";
 
 export type PartialExcept<T, K extends keyof T> = Partial<Omit<T, K>> &
@@ -29,7 +25,8 @@ export type MenuItemButton = {
   selected?: boolean;
   disabled?: boolean;
   icon?: React.ReactNode;
-  tooltip?: React.ReactChild;
+  tooltip?: React.ReactNode;
+  shortcut?: string[];
 };
 
 export type MenuItemWithChildren = {
@@ -64,6 +61,7 @@ export type MenuInternalLink = {
   selected?: boolean;
   disabled?: boolean;
   icon?: React.ReactNode;
+  shortcut?: string[];
 };
 
 export type MenuExternalLink = {
@@ -75,6 +73,7 @@ export type MenuExternalLink = {
   disabled?: boolean;
   level?: number;
   icon?: React.ReactNode;
+  shortcut?: string[];
 };
 
 export type MenuGroup = {
@@ -105,6 +104,10 @@ export type ActionContext = {
   isMenu: boolean;
   isCommandBar: boolean;
   isButton: boolean;
+  /** True when the action runs as a WebMCP tool invoked by an agent. */
+  isMCP?: boolean;
+  /** Arguments supplied by an agent when the action runs as a WebMCP tool. */
+  mcpArgs?: Record<string, unknown>;
   sidebarContext?: SidebarContextType;
 
   // Legacy (backward compatibility) - returns primary active model's ID
@@ -113,13 +116,13 @@ export type ActionContext = {
 
   // New API - work directly with Model instances
   getActiveModels: <T extends Model>(
-    modelClass: new (...args: any[]) => T
+    modelClass: new (...args: never[]) => T
   ) => T[];
   getActiveModel: <T extends Model>(
-    modelClass: new (...args: any[]) => T
+    modelClass: new (...args: never[]) => T
   ) => T | undefined;
   getActivePolicies: <T extends Model>(
-    modelClass: new (...args: any[]) => T
+    modelClass: new (...args: never[]) => T
   ) => Policy[];
   isModelActive: (model: Model) => boolean;
   activeModels: ReadonlySet<Model>;
@@ -139,25 +142,30 @@ type BaseAction = {
   name: ((context: ActionContext) => React.ReactNode) | React.ReactNode;
   section: ((context: ActionContext) => string) | string;
   description?: ((context: ActionContext) => string) | string;
-  shortcut?: string[];
+  shortcut?: ((context: ActionContext) => string[] | undefined) | string[];
   keywords?: string;
   /** Higher number is higher in results, default is 0. */
   priority?: number;
   icon?: ((context: ActionContext) => React.ReactNode) | React.ReactNode;
   iconInContextMenu?: boolean;
+  /** Additional content displayed at the end of the item in the command bar. */
+  badge?: ((context: ActionContext) => React.ReactNode) | React.ReactNode;
   placeholder?: ((context: ActionContext) => string) | string;
   selected?: ((context: ActionContext) => boolean) | boolean;
   visible?: ((context: ActionContext) => boolean) | boolean;
   disabled?: ((context: ActionContext) => boolean) | boolean;
+  /** Configuration for exposing the action as a WebMCP tool. */
+  mcp?: {
+    /** JSON Schema describing the tool arguments, passed as `mcpArgs`. */
+    inputSchema?: Record<string, unknown>;
+  };
 };
 
 export type Action = BaseAction & {
   variant: "action";
   dangerous?: boolean;
-  tooltip?:
-    | ((context: ActionContext) => React.ReactChild | undefined)
-    | React.ReactChild;
-  perform: (context: ActionContext) => any;
+  tooltip?: ((context: ActionContext) => React.ReactNode) | React.ReactNode;
+  perform: (context: ActionContext) => unknown;
 };
 
 export type InternalLinkAction = BaseAction & {
@@ -179,6 +187,8 @@ export type ActionWithChildren = BaseAction & {
       ) => (ActionVariant | ActionGroup | ActionSeparator)[])
     | (ActionVariant | ActionGroup | ActionSeparator)[];
 };
+
+export type ActionFactory = () => ActionWithChildren;
 
 export type ActionVariant =
   | Action
@@ -209,10 +219,6 @@ export type CommandBarAction = {
   perform?: () => void;
   children?: string[];
   parent?: string;
-};
-
-export type LocationWithState = Location & {
-  state: Record<string, string>;
 };
 
 export type FetchOptions = {
@@ -273,16 +279,6 @@ export type WebsocketCommentReactionEvent = {
   user: User;
 };
 
-export type WebsocketEvent =
-  | PartialExcept<Pin, "id">
-  | PartialExcept<Star, "id">
-  | PartialExcept<FileOperation, "id">
-  | PartialExcept<UserMembership, "id">
-  | WebsocketCollectionUpdateIndexEvent
-  | WebsocketEntityDeletedEvent
-  | WebsocketEntitiesEvent
-  | WebsocketCommentReactionEvent;
-
 type CursorPosition = {
   type: {
     client: number;
@@ -322,11 +318,10 @@ export type Permission = {
   divider?: boolean;
 };
 
-// TODO: Can we make this type driven by the @Field decorator
 export type Properties<C> = {
-  [Property in keyof C as C[Property] extends JSONValue
-    ? Property
-    : never]?: C[Property];
+  [
+    Property in keyof C as C[Property] extends JSONValue ? Property : never
+  ]?: C[Property];
 };
 
 export enum CommentSortType {

@@ -1,4 +1,5 @@
-import Router from "koa-router";
+import Router from "@koa/router";
+import { errToString } from "@shared/utils/error";
 import { Client, NotificationEventType } from "@shared/types";
 import { parseDomain } from "@shared/utils/domains";
 import InviteAcceptedEmail from "@server/emails/templates/InviteAcceptedEmail";
@@ -14,7 +15,9 @@ import type { APIContext } from "@server/types";
 import { RateLimiterStrategy } from "@server/utils/RateLimiter";
 import { VerificationCode } from "@server/utils/VerificationCode";
 import { signIn } from "@server/utils/authentication";
+import { getTokenFromCookie } from "@server/utils/csrf";
 import { getUserForEmailSigninToken } from "@server/utils/jwt";
+import { getTeamFromContext } from "@server/utils/passport";
 import * as T from "./schema";
 import { CSRF } from "@shared/constants";
 
@@ -34,7 +37,7 @@ router.post(
       team = await Team.scope("withAuthenticationProviders").findOne();
     } else if (domain.custom) {
       team = await Team.scope("withAuthenticationProviders").findOne({
-        where: { domain: domain.host },
+        where: { domain: domain.host.toLowerCase() },
       });
     } else if (domain.teamSubdomain) {
       team = await Team.scope("withAuthenticationProviders").findOne({
@@ -110,7 +113,7 @@ const emailCallback = async (ctx: APIContext<T.EmailCallbackReq>) => {
   // and spending the token before the user clicks on it. Instead we redirect
   // to the same URL with the follow query param added from the client side.
   if (!follow) {
-    const csrfToken = ctx.cookies.get(CSRF.cookieName);
+    const csrfToken = getTokenFromCookie(ctx);
 
     // Parse the current URL to extract existing query parameters
     const url = new URL(ctx.request.href);
@@ -128,35 +131,47 @@ const emailCallback = async (ctx: APIContext<T.EmailCallbackReq>) => {
     return ctx.redirectOnClient(url.toString(), "POST");
   }
 
-  let user!: User;
+  let user: User | null = null;
 
   try {
     if (token) {
       user = await getUserForEmailSigninToken(ctx, token as string);
     } else if (code && email) {
+      const team = await getTeamFromContext(ctx);
+
+      if (!team) {
+        ctx.redirect("/?notice=auth-error&description=Unknown%20team");
+        return;
+      }
+
       user = await User.scope("withTeam").findOne({
-        rejectOnEmpty: true,
         where: {
+          teamId: team.id,
           email: email.trim().toLowerCase(),
         },
       });
 
-      const isValid = await VerificationCode.verify(email, code);
-
-      if (!isValid) {
+      if (!user || !(await VerificationCode.verify(team.id, email, code))) {
         ctx.redirect(`/?notice=invalid-code`);
         return;
       }
 
       // Delete the code after successful verification
-      await VerificationCode.delete(email);
+      await VerificationCode.delete(team.id, email);
     } else {
       ctx.redirect("/?notice=auth-error&description=Missing%20token");
       return;
     }
   } catch (err) {
-    Logger.debug("authentication", err);
-    return ctx.redirect(`/?notice=auth-error&description=${err.message}`);
+    const message = errToString(err);
+    Logger.debug("authentication", message);
+    return ctx.redirect(
+      `/?notice=auth-error&description=${encodeURIComponent(message)}`
+    );
+  }
+
+  if (!user) {
+    return ctx.redirect(`/?notice=invalid-code`);
   }
 
   if (!user.team.emailSigninEnabled) {
@@ -198,17 +213,14 @@ const emailCallback = async (ctx: APIContext<T.EmailCallbackReq>) => {
     client,
   });
 };
-router.get(
+router.register(
   "email.callback",
-  rateLimiter(RateLimiterStrategy.FivePerMinute),
-  validate(T.EmailCallbackSchema),
-  emailCallback
-);
-router.post(
-  "email.callback",
-  rateLimiter(RateLimiterStrategy.FivePerMinute),
-  validate(T.EmailCallbackSchema),
-  emailCallback
+  ["get", "post"],
+  [
+    rateLimiter(RateLimiterStrategy.FivePerMinute),
+    validate(T.EmailCallbackSchema),
+    emailCallback,
+  ]
 );
 
 export default router;

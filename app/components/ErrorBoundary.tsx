@@ -1,8 +1,8 @@
-import { observable } from "mobx";
+import { makeObservable, observable } from "mobx";
 import { observer } from "mobx-react";
 import * as React from "react";
-import type { WithTranslation } from "react-i18next";
-import { withTranslation, Trans } from "react-i18next";
+import type { TFunction } from "i18next";
+import { Trans, useTranslation } from "react-i18next";
 import styled from "styled-components";
 import { s } from "@shared/styles";
 import { UrlHelper } from "@shared/utils/UrlHelper";
@@ -14,32 +14,44 @@ import Text from "~/components/Text";
 import env from "~/env";
 import Logger from "~/utils/Logger";
 import isCloudHosted from "~/utils/isCloudHosted";
+import { isStaleChunkError } from "@shared/utils/lazyWithRetry";
 import Storage from "@shared/utils/Storage";
 import { deleteAllDatabases } from "~/utils/developer";
 import Flex from "./Flex";
 
-type Props = WithTranslation & {
+interface OwnProps {
   /** Whether to reload the page if a chunk fails to load. */
   reloadOnChunkMissing?: boolean;
   /** Whether to show a title heading. */
   showTitle?: boolean;
   /** The wrapping component to use. */
-  component?: React.ComponentType | string;
+  component?: React.ComponentType<React.PropsWithChildren> | string;
+  /** Children rendered when no error is present. */
+  children?: React.ReactNode;
+}
+
+type Props = OwnProps & {
+  t: TFunction;
 };
 
 const ERROR_TRACKING_KEY = "error-boundary-tracking";
 const ERROR_TRACKING_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
 @observer
-class ErrorBoundary extends React.Component<Props> {
+class ErrorBoundaryClass extends React.Component<Props> {
   @observable
-  error: Error | null | undefined;
+  error: Error | null | undefined = undefined;
 
   @observable
   showDetails = false;
 
   @observable
   isRepeatedError = false;
+
+  constructor(props: Props) {
+    super(props);
+    makeObservable(this);
+  }
 
   componentDidMount() {
     this.checkForPreviousErrors();
@@ -51,8 +63,7 @@ class ErrorBoundary extends React.Component<Props> {
 
     if (
       this.props.reloadOnChunkMissing &&
-      error.message &&
-      error.message.match(/dynamically imported module/) &&
+      isStaleChunkError(error) &&
       !this.isRepeatedError
     ) {
       // If the editor bundle fails to load then reload the entire window. This
@@ -127,19 +138,14 @@ class ErrorBoundary extends React.Component<Props> {
     if (this.error) {
       const error = this.error;
       const isReported = !!env.SENTRY_DSN && isCloudHosted;
-      const isChunkError = [
-        "module script failed",
-        "dynamically imported module",
-      ].some((msg) => this.error?.message?.includes(msg));
-
-      if (isChunkError) {
+      if (isStaleChunkError(error)) {
         return (
           <Component>
             {showTitle && (
               <>
                 <PageTitle title={t("Module failed to load")} />
                 <Heading>
-                  <Trans>Loading Failed</Trans>
+                  <Trans>Loading failed</Trans>
                 </Heading>
               </>
             )}
@@ -161,9 +167,9 @@ class ErrorBoundary extends React.Component<Props> {
         <Component>
           {showTitle && (
             <>
-              <PageTitle title={t("Something Unexpected Happened")} />
+              <PageTitle title={t("Something unexpected happened")} />
               <Heading>
-                <Trans>Something Unexpected Happened</Trans>
+                <Trans>Something unexpected happened</Trans>
               </Heading>
             </>
           )}
@@ -223,4 +229,9 @@ const Pre = styled.pre`
   white-space: pre-wrap;
 `;
 
-export default withTranslation()(ErrorBoundary);
+function ErrorBoundary(props: OwnProps) {
+  const { t } = useTranslation();
+  return <ErrorBoundaryClass t={t} {...props} />;
+}
+
+export default ErrorBoundary;

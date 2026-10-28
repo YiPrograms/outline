@@ -13,23 +13,23 @@ import {
   TableIcon,
   TodoListIcon,
   ImageIcon,
-  StarredIcon,
-  WarningIcon,
-  InfoIcon,
   AttachmentIcon,
-  ClockIcon,
   CalendarIcon,
   MathIcon,
-  DoneIcon,
   EmbedIcon,
   CollapseIcon,
 } from "outline-icons";
 import * as React from "react";
 import styled from "styled-components";
+import { v4 as uuidv4 } from "uuid";
+import type { TFunction } from "i18next";
 import Image from "@shared/editor/components/Img";
+import { NoticeTypes } from "@shared/editor/nodes/Notice";
 import type { MenuItem } from "@shared/editor/types";
+import { MentionType } from "@shared/types";
+import { toISODate } from "@shared/utils/date";
 import { metaDisplay } from "@shared/utils/keyboard";
-import type { Dictionary } from "~/hooks/useDictionary";
+import { NoticeIcon } from "~/editor/components/NoticeIcon";
 import Desktop from "~/utils/Desktop";
 
 const Img = styled(Image)`
@@ -42,40 +42,40 @@ const Img = styled(Image)`
 `;
 
 export default function blockMenuItems(
-  dictionary: Dictionary,
-  documentRef: React.RefObject<HTMLDivElement>
+  t: TFunction,
+  documentRef: React.RefObject<HTMLDivElement | null>
 ): MenuItem[] {
   const documentWidth = documentRef.current?.clientWidth ?? 0;
 
   const items = [
     {
       name: "heading",
-      title: dictionary.h1,
-      keywords: "h1 heading1 title",
+      title: t("Big heading"),
+      keywords: "h1 heading1 title header",
       icon: <Heading1Icon />,
       shortcut: "^ ⇧ 1",
       attrs: { level: 1 },
     },
     {
       name: "heading",
-      title: dictionary.h2,
-      keywords: "h2 heading2",
+      title: t("Medium heading"),
+      keywords: "h2 heading2 header subtitle",
       icon: <Heading2Icon />,
       shortcut: "^ ⇧ 2",
       attrs: { level: 2 },
     },
     {
       name: "heading",
-      title: dictionary.h3,
-      keywords: "h3 heading3",
+      title: t("Small heading"),
+      keywords: "h3 heading3 header",
       icon: <Heading3Icon />,
       shortcut: "^ ⇧ 3",
       attrs: { level: 3 },
     },
     {
       name: "heading",
-      title: dictionary.h4,
-      keywords: "h4 heading4",
+      title: t("Extra small heading"),
+      keywords: "h4 heading4 header",
       icon: <Heading4Icon />,
       shortcut: "^ ⇧ 4",
       attrs: { level: 4 },
@@ -85,21 +85,23 @@ export default function blockMenuItems(
     },
     {
       name: "checkbox_list",
-      title: dictionary.checkboxList,
+      title: t("Todo list"),
       icon: <TodoListIcon />,
       keywords: "checklist checkbox task",
       shortcut: "^ ⇧ 7",
     },
     {
       name: "bullet_list",
-      title: dictionary.bulletList,
+      title: t("Bulleted list"),
       icon: <BulletedListIcon />,
+      keywords: "unordered dash point",
       shortcut: "^ ⇧ 8",
     },
     {
       name: "ordered_list",
-      title: dictionary.orderedList,
+      title: t("Ordered list"),
       icon: <OrderedListIcon />,
+      keywords: "ol numbered",
       shortcut: "^ ⇧ 9",
     },
     {
@@ -107,38 +109,37 @@ export default function blockMenuItems(
     },
     {
       name: "image",
-      title: dictionary.image,
+      title: t("Image"),
       icon: <ImageIcon />,
-      keywords: "picture photo",
+      keywords: "picture photo img upload png jpg screenshot",
     },
     {
       name: "video",
-      title: dictionary.video,
+      title: t("Video"),
       icon: <EmbedIcon />,
-      keywords: "mov avi upload player",
+      keywords: "movie avi mp4 film upload player",
     },
     {
       name: "attachment",
-      title: dictionary.pdf,
+      title: t("Embed PDF"),
       icon: <PDFIcon />,
-      keywords: "pdf upload attach",
+      keywords: "document upload attach",
       attrs: {
         accept: "application/pdf",
-        width: 300,
-        height: 424,
         preview: true,
       },
     },
     {
       name: "attachment",
-      title: dictionary.file,
+      title: t("File attachment"),
       icon: <AttachmentIcon />,
-      keywords: "file upload attach",
+      keywords: "upload attach",
     },
     {
       name: "table",
-      title: dictionary.table,
+      title: t("Table"),
       icon: <TableIcon />,
+      keywords: "grid spreadsheet rows columns cells",
       attrs: {
         rowsCount: 3,
         colsCount: 3,
@@ -147,114 +148,145 @@ export default function blockMenuItems(
     },
     {
       name: "kanban",
-      title: dictionary.kanban,
+      title: t("Kanban board"),
       icon: <TableIcon />,
       keywords: "kanban board task project",
     },
     {
       name: "blockquote",
-      title: dictionary.quote,
+      title: t("Quote"),
       icon: <BlockQuoteIcon />,
-      keywords: "blockquote pullquote",
+      keywords: "blockquote pullquote citation",
       shortcut: `${metaDisplay} ]`,
     },
     {
       name: "code_block",
-      title: dictionary.codeBlock,
+      title: t("Code block"),
       icon: <CodeIcon />,
       shortcut: "^ ⇧ c",
-      keywords: "script",
+      keywords: "script snippet syntax pre",
     },
     {
       name: "math_block",
-      title: dictionary.mathBlock,
+      title: t("Math block (LaTeX)"),
       icon: <MathIcon />,
-      keywords: "math katex latex",
-    },
-    {
-      name: "container_toggle",
-      title: dictionary.toggleBlock,
-      icon: <CollapseIcon />,
-      keywords: "toggle collapsible collapse fold",
+      keywords: "katex formula equation",
     },
     {
       name: "hr",
-      title: dictionary.hr,
+      title: t("Divider"),
       icon: <HorizontalRuleIcon />,
       shortcut: `${metaDisplay} _`,
-      keywords: "horizontal rule break line",
+      keywords: "horizontal rule break line separator",
     },
     {
       name: "hr",
-      title: dictionary.pageBreak,
+      title: t("Page break"),
       icon: <PageBreakIcon />,
-      keywords: "page print break line",
+      keywords: "pagebreak print line",
       attrs: { markup: "***" },
     },
     {
-      name: "date",
-      title: dictionary.insertDate,
-      keywords: "clock today",
+      // Inserts a date mention for today. Supersedes the deprecated "Current
+      // date/time" commands that inserted a static string or template token.
+      name: "mention",
+      title: t("Current date"),
+      keywords: "clock today time now",
       icon: <CalendarIcon />,
+      appendSpace: true,
+      attrs: () => {
+        const modelId = toISODate(new Date());
+        return {
+          id: uuidv4(),
+          type: MentionType.Date,
+          modelId,
+          label: modelId,
+        };
+      },
     },
     {
-      name: "time",
-      title: dictionary.insertTime,
-      keywords: "clock now",
-      icon: <ClockIcon />,
+      name: "separator",
     },
     {
-      name: "datetime",
-      title: dictionary.insertDateTime,
-      keywords: "clock today date",
-      icon: <CalendarIcon />,
+      name: "container_toggle",
+      title: t("Toggle block"),
+      icon: <CollapseIcon />,
+      keywords: "collapsible collapse fold accordion details expand",
+    },
+    {
+      name: "container_toggle",
+      title: t("Big toggle heading"),
+      icon: <Heading1Icon />,
+      keywords: "collapsible collapse fold accordion details expand h1",
+      attrs: { level: 1 },
+    },
+    {
+      name: "container_toggle",
+      title: t("Medium toggle heading"),
+      icon: <Heading2Icon />,
+      keywords: "collapsible collapse fold accordion details expand h2",
+      attrs: { level: 2 },
+    },
+    {
+      name: "container_toggle",
+      title: t("Small toggle heading"),
+      icon: <Heading3Icon />,
+      keywords: "collapsible collapse fold accordion details expand h3",
+      attrs: { level: 3 },
+    },
+    {
+      name: "container_toggle",
+      title: t("Extra small toggle heading"),
+      icon: <Heading4Icon />,
+      keywords: "collapsible collapse fold accordion details expand h4",
+      attrs: { level: 4 },
     },
     {
       name: "separator",
     },
     {
       name: "container_notice",
-      title: dictionary.infoNotice,
-      icon: <InfoIcon />,
-      keywords: "notice card information",
-      attrs: { style: "info" },
+      title: t("Info notice"),
+      icon: <NoticeIcon type={NoticeTypes.Info} />,
+      keywords: "card callout hint information note",
+      attrs: { style: NoticeTypes.Info },
     },
     {
       name: "container_notice",
-      title: dictionary.successNotice,
-      icon: <DoneIcon />,
-      keywords: "notice card success",
-      attrs: { style: "success" },
+      title: t("Success notice"),
+      icon: <NoticeIcon type={NoticeTypes.Success} />,
+      keywords: "card callout hint",
+      attrs: { style: NoticeTypes.Success },
     },
     {
       name: "container_notice",
-      title: dictionary.warningNotice,
-      icon: <WarningIcon />,
-      keywords: "notice card error",
-      attrs: { style: "warning" },
+      title: t("Warning notice"),
+      icon: <NoticeIcon type={NoticeTypes.Warning} />,
+      keywords: "card callout hint error caution danger alert",
+      attrs: { style: NoticeTypes.Warning },
     },
     {
       name: "container_notice",
-      title: dictionary.tipNotice,
-      icon: <StarredIcon />,
-      keywords: "notice card suggestion",
-      attrs: { style: "tip" },
+      title: t("Tip notice"),
+      icon: <NoticeIcon type={NoticeTypes.Tip} />,
+      keywords: "card callout hint suggestion",
+      attrs: { style: NoticeTypes.Tip },
     },
     {
       name: "separator",
     },
     {
       name: "code_block",
-      title: "Mermaid Diagram",
-      icon: <Img src="/images/mermaidjs.png" alt="Mermaid Diagram" />,
-      keywords: "diagram flowchart",
+      title: "Mermaid diagram",
+      icon: <Img src="/images/mermaidjs.png" alt="Mermaid diagram" />,
+      keywords: "flowchart graph sequence gantt",
       attrs: { language: "mermaid" },
     },
     {
       name: "editDiagram",
-      title: "Diagrams.net Diagram",
-      icon: <Img src="/images/diagrams.png" alt="Diagrams.net Diagram" />,
-      keywords: "diagram flowchart draw.io",
+      title: "Diagrams.net diagram",
+      icon: <Img src="/images/diagrams.png" alt="Diagrams.net diagram" />,
+      keywords: "flowchart drawio draw.io whiteboard",
     },
   ];
 

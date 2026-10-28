@@ -55,15 +55,11 @@ export default class PasteHandler extends Extension {
           },
           handleDOMEvents: {
             keydown: (_, event) => {
-              if (event.key === "Shift") {
-                this.shiftKey = true;
-              }
+              this.shiftKey = event.shiftKey;
               return false;
             },
             keyup: (_, event) => {
-              if (event.key === "Shift") {
-                this.shiftKey = false;
-              }
+              this.shiftKey = event.shiftKey;
               return false;
             },
           },
@@ -102,28 +98,37 @@ export default class PasteHandler extends Extension {
 
             if (!this.shiftKey) {
               // If the HTML on the clipboard is from Prosemirror then the best
-              // compatability is to just use the HTML parser, regardless of
+              // compatibility is to just use the HTML parser, regardless of
               // whether it "looks" like Markdown, see: outline/outline#2416
               if (html?.includes("data-pm-slice")) {
                 return false;
               }
 
-              // Check if the clipboard contents can be parsed as a single url
-              if (isUrl(text)) {
+              // If the HTML on the clipboard is from Claude then the best
+              // compatibility is to just use the HTML parser.
+              if (html?.includes("font-claude-response-body")) {
+                return false;
+              }
+
+              // Check if the clipboard contents can be parsed as a single url.
+              // Trim first so surrounding whitespace from the clipboard (e.g. a
+              // trailing newline appended by the source) doesn't prevent URL
+              // detection and skip the paste menu.
+              const trimmedText = text.trim();
+              if (isUrl(trimmedText)) {
                 // If there is selected text then we want to wrap it in a link to the url
                 if (!state.selection.empty) {
-                  toggleMark(this.editor.schema.marks.link, { href: text })(
-                    state,
-                    dispatch
-                  );
+                  toggleMark(this.editor.schema.marks.link, {
+                    href: trimmedText,
+                  })(state, dispatch);
                   return true;
                 }
 
                 // Is the link a link to a document? If so, we can grab the title and insert it.
-                const containsHash = text.includes("#");
+                const containsHash = trimmedText.includes("#");
 
-                if (isDocumentUrl(text)) {
-                  const slug = parseDocumentSlug(text);
+                if (isDocumentUrl(trimmedText)) {
+                  const slug = parseDocumentSlug(trimmedText);
 
                   if (slug) {
                     void stores.documents
@@ -133,7 +138,10 @@ export default class PasteHandler extends Extension {
                           return;
                         }
                         if (document) {
-                          if (state.schema.nodes.mention && !containsHash) {
+                          if (state.schema.nodes.mention) {
+                            const { hash } = new URL(trimmedText);
+                            const trimmedHash = hash.substring(1);
+
                             view.dispatch(
                               view.state.tr.replaceWith(
                                 state.selection.from,
@@ -141,20 +149,23 @@ export default class PasteHandler extends Extension {
                                 state.schema.nodes.mention.create({
                                   type: MentionType.Document,
                                   modelId: document.id,
-                                  label: document.titleWithDefault,
+                                  label: document.displayTitle,
                                   id: uuidv4(),
+                                  anchorId: trimmedHash.length
+                                    ? trimmedHash
+                                    : undefined,
                                 })
                               )
                             );
                           } else {
-                            const { hash } = new URL(text);
+                            const { hash } = new URL(trimmedText);
                             const hasEmoji =
                               determineIconType(document.icon) ===
                               IconType.Emoji;
 
-                            const title = `${
-                              hasEmoji ? document.icon + " " : ""
-                            }${document.titleWithDefault}`;
+                            const title = `${hasEmoji ? document.icon + " " : ""}${
+                              document.displayTitle
+                            }`;
 
                             this.insertLink(`${document.path}${hash}`, title);
                           }
@@ -164,11 +175,11 @@ export default class PasteHandler extends Extension {
                         if (view.isDestroyed) {
                           return;
                         }
-                        this.insertLink(text);
+                        this.insertLink(trimmedText);
                       });
                   }
-                } else if (isCollectionUrl(text)) {
-                  const slug = parseCollectionSlug(text);
+                } else if (isCollectionUrl(trimmedText)) {
+                  const slug = parseCollectionSlug(trimmedText);
 
                   if (slug) {
                     stores.collections
@@ -186,20 +197,20 @@ export default class PasteHandler extends Extension {
                                 state.schema.nodes.mention.create({
                                   type: MentionType.Collection,
                                   modelId: collection.id,
-                                  label: collection.name,
+                                  label: collection.displayName,
                                   id: uuidv4(),
                                 })
                               )
                             );
                           } else {
-                            const { hash } = new URL(text);
+                            const { hash } = new URL(trimmedText);
                             const hasEmoji =
                               determineIconType(collection.icon) ===
                               IconType.Emoji;
 
-                            const title = `${
-                              hasEmoji ? collection.icon + " " : ""
-                            }${collection.name}`;
+                            const title = `${hasEmoji ? collection.icon + " " : ""}${
+                              collection.displayName
+                            }`;
 
                             this.insertLink(`${collection.path}${hash}`, title);
                           }
@@ -209,11 +220,11 @@ export default class PasteHandler extends Extension {
                         if (view.isDestroyed) {
                           return;
                         }
-                        this.insertLink(text);
+                        this.insertLink(trimmedText);
                       });
                   }
                 } else {
-                  this.insertLink(text);
+                  this.insertLink(trimmedText);
                 }
 
                 return true;
@@ -230,7 +241,7 @@ export default class PasteHandler extends Extension {
                             vscodeMeta.mode
                           )
                             ? vscodeMeta.mode
-                            : null,
+                            : "none",
                         })
                       )
                       .insertText(text)
@@ -240,19 +251,17 @@ export default class PasteHandler extends Extension {
 
                 if (supportsCodeMark) {
                   event.preventDefault();
-                  view.dispatch(
-                    state.tr
-                      .insertText(
-                        text,
-                        state.selection.from,
-                        state.selection.to
-                      )
-                      .addMark(
-                        state.selection.from,
-                        state.selection.to + text.length,
-                        state.schema.marks.code_inline.create()
-                      )
-                  );
+                  const { from, to } = state.selection;
+                  const tr = state.tr.insertText(text, from, to);
+                  if (text.length > 0) {
+                    // The inserted text now spans from the selection start
+                    tr.addMark(
+                      from,
+                      from + text.length,
+                      state.schema.marks.code_inline.create()
+                    );
+                  }
+                  view.dispatch(tr);
                   return true;
                 }
               }
@@ -263,7 +272,8 @@ export default class PasteHandler extends Extension {
             if (
               (isMarkdown(text) &&
                 !isDropboxPaper(html) &&
-                !isContainingImage(html)) ||
+                !isContainingImage(html) &&
+                !isContainingTable(html)) ||
               pasteCodeLanguage === "markdown" ||
               this.shiftKey ||
               !html
@@ -314,7 +324,7 @@ export default class PasteHandler extends Extension {
         },
         state: {
           init: () => DecorationSet.empty,
-          apply: (tr, set) => {
+          apply: (tr, set, _oldState, newState) => {
             let mapping = tr.mapping;
 
             // See if the transaction adds or removes any placeholders
@@ -340,7 +350,7 @@ export default class PasteHandler extends Extension {
               return DecorationSet.create(tr.doc, decorations);
             }
 
-            if (hasDecorations && (isRemoteTransaction(tr) || meta)) {
+            if (hasDecorations && (isRemoteTransaction(tr, newState) || meta)) {
               try {
                 mapping = recreateTransform(tr.before, tr.doc, {
                   complexSteps: true,
@@ -620,6 +630,17 @@ function isDropboxPaper(html: string): boolean {
  */
 function isContainingImage(html: string): boolean {
   return html?.includes("<img");
+}
+
+/**
+ * Checks if the HTML string contains a table. The plain text alternative on the
+ * clipboard cannot describe a table, so the HTML must be parsed instead.
+ *
+ * @param html The HTML string to check.
+ * @returns True if the HTML string contains a table.
+ */
+function isContainingTable(html: string): boolean {
+  return html?.includes("<table");
 }
 
 function sliceSingleNode(slice: Slice) {

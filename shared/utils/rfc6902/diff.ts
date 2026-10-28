@@ -1,6 +1,5 @@
-import isEqual from "lodash/isEqual";
 import type { Pointer } from "./pointer";
-import { hasOwnProperty, objectType } from "./util";
+import { hasOwn, isJSONEqual, objectType } from "./util";
 
 /**
  * All diff* functions should return a list of operations, often empty.
@@ -102,20 +101,14 @@ export function subtract(
   const obj: { [index: string]: number } = {};
   // build up obj with all the properties of minuend
   for (const add_key in minuend) {
-    if (
-      hasOwnProperty.call(minuend, add_key) &&
-      minuend[add_key] !== undefined
-    ) {
+    if (hasOwn(minuend, add_key) && minuend[add_key] !== undefined) {
       obj[add_key] = 1;
     }
   }
   // now delete all the properties of subtrahend from obj
   // (deleting a missing key has no effect)
   for (const del_key in subtrahend) {
-    if (
-      hasOwnProperty.call(subtrahend, del_key) &&
-      subtrahend[del_key] !== undefined
-    ) {
+    if (hasOwn(subtrahend, del_key) && subtrahend[del_key] !== undefined) {
       delete obj[del_key];
     }
   }
@@ -141,7 +134,7 @@ export function intersection(
   for (let i = 0; i < length; i++) {
     const object = objects[i];
     for (const key in object) {
-      if (hasOwnProperty.call(object, key) && object[key] !== undefined) {
+      if (hasOwn(object, key) && object[key] !== undefined) {
         counter[key] = (counter[key] || 0) + 1;
       }
     }
@@ -261,7 +254,7 @@ export function diffArrays<T>(
   while (
     start < input_length &&
     start < output_length &&
-    isEqual(input[start], output[start])
+    isJSONEqual(input[start], output[start])
   ) {
     start++;
   }
@@ -270,7 +263,7 @@ export function diffArrays<T>(
   let input_end = input_length;
   let output_end = output_length;
   while (input_end > start && output_end > start) {
-    if (isEqual(input[input_end - 1], output[output_end - 1])) {
+    if (isJSONEqual(input[input_end - 1], output[output_end - 1])) {
       input_end--;
       output_end--;
     } else {
@@ -282,8 +275,10 @@ export function diffArrays<T>(
   const subInput = input_end - start;
   const subOutput = output_end - start;
 
+  // oxlint-disable-next-line unicorn/no-new-array
   const memo: Array<Array<DynamicAlternative>> = new Array(subInput + 1);
   for (let i = 0; i <= subInput; i++) {
+    // oxlint-disable-next-line unicorn/no-new-array
     memo[i] = new Array(subOutput + 1);
   }
   memo[0][0] = { prevI: -1, prevJ: -1, operation: null, cost: 0 };
@@ -314,7 +309,7 @@ export function diffArrays<T>(
           cost: memo[i][j - 1].cost + 1,
         };
       } else {
-        if (isEqual(input[inputIdx], output[outputIdx])) {
+        if (isJSONEqual(input[inputIdx], output[outputIdx])) {
           memoized = memo[i - 1][j - 1];
         } else {
           const remove_prev = memo[i - 1][j];

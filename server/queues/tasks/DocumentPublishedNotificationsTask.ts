@@ -1,5 +1,8 @@
 import { MentionType, NotificationEventType } from "@shared/types";
-import { createSubscriptionsForDocument } from "@server/commands/subscriptionCreator";
+import {
+  createSubscriptionsForDocument,
+  subscribeUsersToDocument,
+} from "@server/commands/subscriptionCreator";
 import { Document, Group, Notification, User, GroupUser } from "@server/models";
 import { DocumentHelper } from "@server/models/helpers/DocumentHelper";
 import NotificationHelper from "@server/models/helpers/NotificationHelper";
@@ -22,33 +25,46 @@ export default class DocumentPublishedNotificationsTask extends BaseTask<Documen
     const mentions = DocumentHelper.parseMentions(document, {
       type: MentionType.User,
     });
+    const userIdsProcessed = new Set<string>();
     const userIdsMentioned: string[] = [];
+    const usersToSubscribe: User[] = [];
 
     for (const mention of mentions) {
-      if (userIdsMentioned.includes(mention.modelId)) {
+      if (userIdsProcessed.has(mention.modelId)) {
         continue;
       }
+      userIdsProcessed.add(mention.modelId);
 
+      const actorId = mention.actorId ?? event.actorId;
       const recipient = await User.findByPk(mention.modelId);
 
       if (
-        recipient &&
-        recipient.id !== mention.actorId &&
+        !recipient ||
+        recipient.id === actorId ||
+        !(await canUserAccessDocument(recipient, document.id))
+      ) {
+        continue;
+      }
+
+      usersToSubscribe.push(recipient);
+
+      if (
         recipient.subscribedToEventType(
           NotificationEventType.MentionedInDocument
-        ) &&
-        (await canUserAccessDocument(recipient, document.id))
+        )
       ) {
         await Notification.create({
           event: NotificationEventType.MentionedInDocument,
           userId: recipient.id,
-          actorId: mention.actorId,
+          actorId,
           teamId: document.teamId,
           documentId: document.id,
         });
         userIdsMentioned.push(recipient.id);
       }
     }
+
+    await subscribeUsersToDocument(usersToSubscribe, document, event);
 
     // send notifications to users in mentioned groups
     const groupMentions = DocumentHelper.parseMentions(document, {
@@ -59,6 +75,8 @@ export default class DocumentPublishedNotificationsTask extends BaseTask<Documen
       if (mentionedGroup.includes(group.modelId)) {
         continue;
       }
+
+      const actorId = group.actorId ?? event.actorId;
 
       // Check if the group has mentions disabled
       const groupModel = await Group.findByPk(group.modelId);
@@ -82,7 +100,7 @@ export default class DocumentPublishedNotificationsTask extends BaseTask<Documen
         const recipient = await User.findByPk(user.userId);
         if (
           recipient &&
-          recipient.id !== group.actorId &&
+          recipient.id !== actorId &&
           recipient.subscribedToEventType(
             NotificationEventType.GroupMentionedInDocument
           ) &&
@@ -92,7 +110,7 @@ export default class DocumentPublishedNotificationsTask extends BaseTask<Documen
             event: NotificationEventType.GroupMentionedInDocument,
             groupId: group.modelId,
             userId: recipient.id,
-            actorId: group.actorId,
+            actorId,
             teamId: document.teamId,
             documentId: document.id,
           });

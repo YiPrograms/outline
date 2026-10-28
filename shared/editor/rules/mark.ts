@@ -1,14 +1,13 @@
 // Adapted from:
 // https://github.com/markdown-it/markdown-it-mark/blob/master/index.js
 
-import type { StateInline } from "markdown-it";
 import type MarkdownIt from "markdown-it";
 
 export default function (options: { delim: string; mark: string }) {
   const delimCharCode = options.delim.charCodeAt(0);
 
   return function emphasisPlugin(md: MarkdownIt) {
-    function tokenize(state: StateInline, silent: boolean) {
+    function tokenize(state: MarkdownIt.StateInline, silent: boolean) {
       let i, token;
 
       const start = state.pos,
@@ -47,8 +46,6 @@ export default function (options: { delim: string; mark: string }) {
         state.delimiters.push({
           marker,
           length: 0, // disable "rule of 3" length checks meant for emphasis
-          // @ts-expect-error unknown property
-          jump: i,
           token: state.tokens.length - 1,
           end: -1,
           open: scanned.can_open,
@@ -63,8 +60,8 @@ export default function (options: { delim: string; mark: string }) {
     // Walk through delimiter list and replace text tokens with tags
     //
     function postProcess(
-      state: StateInline,
-      delimiters: StateInline.Delimiter[]
+      state: MarkdownIt.StateInline,
+      delimiters: MarkdownIt.StateInline.Delimiter[]
     ) {
       let i = 0,
         j,

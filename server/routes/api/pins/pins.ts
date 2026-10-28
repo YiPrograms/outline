@@ -1,7 +1,8 @@
-import Router from "koa-router";
+import Router from "@koa/router";
 import { Sequelize, Op, Transaction } from "sequelize";
 import pinCreator from "@server/commands/pinCreator";
 import auth from "@server/middlewares/authentication";
+import { rateLimiter } from "@server/middlewares/rateLimiter";
 import { transaction } from "@server/middlewares/transaction";
 import validate from "@server/middlewares/validate";
 import { Collection, Document, Pin } from "@server/models";
@@ -12,6 +13,7 @@ import {
   presentPolicies,
 } from "@server/presenters";
 import type { APIContext } from "@server/types";
+import { RateLimiterStrategy } from "@server/utils/RateLimiter";
 import pagination from "../middlewares/pagination";
 import * as T from "./schema";
 
@@ -19,6 +21,7 @@ const router = new Router();
 
 router.post(
   "pins.create",
+  rateLimiter(RateLimiterStrategy.TwentyFivePerMinute),
   auth(),
   validate(T.PinsCreateSchema),
   transaction(),
@@ -37,7 +40,7 @@ router.post(
         userId: user.id,
         transaction,
       });
-      authorize(user, "update", collection);
+      authorize(user, "pin", collection);
       authorize(user, "pin", document);
     } else {
       authorize(user, "pinToHome", document);
@@ -66,7 +69,10 @@ router.post(
     const { user } = ctx.state.auth;
     const { documentId, collectionId } = ctx.input.body;
 
-    const document = await Document.findByPk(documentId, { userId: user.id });
+    const document = await Document.findByPk(documentId, {
+      userId: user.id,
+      includeContent: false,
+    });
     authorize(user, "read", document);
 
     // There can be only one pin with these props.
@@ -132,12 +138,17 @@ router.post(
       },
     });
 
-    const policies = presentPolicies(user, [...documents, ...pins]);
+    // Pins are not scoped to document memberships, so only return those for
+    // documents the user can read.
+    const documentIds = new Set(documents.map((document) => document.id));
+    const visiblePins = pins.filter((pin) => documentIds.has(pin.documentId));
+
+    const policies = presentPolicies(user, [...documents, ...visiblePins]);
 
     ctx.body = {
       pagination: ctx.state.pagination,
       data: {
-        pins: pins.map(presentPin),
+        pins: visiblePins.map(presentPin),
         documents: await presentDocuments(ctx, documents),
       },
       policies,

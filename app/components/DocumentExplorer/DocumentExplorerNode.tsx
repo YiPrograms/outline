@@ -2,46 +2,59 @@ import { observer } from "mobx-react";
 import * as React from "react";
 import { useTranslation } from "react-i18next";
 import styled from "styled-components";
-import breakpoint from "styled-components-breakpoint";
+import { breakpoint } from "@shared/styles/breakpoint";
 import { s, ellipsis } from "@shared/styles";
 import Flex from "~/components/Flex";
 import Disclosure from "~/components/Sidebar/components/Disclosure";
 import Text from "~/components/Text";
 
 type Props = {
+  /** Whether this node is the chosen destination (committed pick via click or Enter). */
   selected: boolean;
+  /** Whether this node is currently highlighted by pointer hover or keyboard navigation. */
   active: boolean;
+  /** Inline style passed in by the virtualized list for absolute positioning. */
   style: React.CSSProperties;
+  /** Whether this node's children are currently revealed in the tree. */
   expanded: boolean;
+  /** Icon rendered before the title (document icon, emoji, or star). */
   icon?: React.ReactNode;
+  /** Display title for the node. */
   title: string;
+  /** Zero-based nesting depth, used to indent the node. */
   depth: number;
+  /** Whether this node has descendants and should render a disclosure chevron. */
   hasChildren: boolean;
-
+  /** Fired when the disclosure chevron is clicked to expand or collapse the node. */
   onDisclosureClick: (ev: React.MouseEvent) => void;
+  /** Fired on pointer movement over the node; used to update the active highlight. */
   onPointerMove: (ev: React.MouseEvent) => void;
+  /** Fired when the node is clicked to select it. */
   onClick: (ev: React.MouseEvent) => void;
+  /** Fired when the node is double-clicked to submit the current selection. */
+  onDoubleClick: (ev: React.MouseEvent) => void;
+  /** Ref to the node element. */
+  ref?: React.Ref<HTMLSpanElement>;
 };
 
-function DocumentExplorerNode(
-  {
-    selected,
-    active,
-    style,
-    expanded,
-    icon,
-    title,
-    depth,
-    hasChildren,
-    onDisclosureClick,
-    onPointerMove,
-    onClick,
-  }: Props,
-  ref: React.RefObject<HTMLSpanElement>
-) {
+function DocumentExplorerNode({
+  selected,
+  active,
+  style,
+  expanded,
+  icon,
+  title,
+  depth,
+  hasChildren,
+  onDisclosureClick,
+  onPointerMove,
+  onClick,
+  onDoubleClick,
+  ref,
+}: Props) {
   const { t } = useTranslation();
   const DISCLOSURE = 24;
-  const width = (depth + (hasChildren ? 2 : 1)) * DISCLOSURE;
+  const width = (depth + 2) * DISCLOSURE;
 
   return (
     <Node
@@ -49,6 +62,7 @@ function DocumentExplorerNode(
       selected={selected}
       active={active}
       onClick={onClick}
+      onDoubleClick={onDoubleClick}
       style={style}
       onPointerMove={onPointerMove}
       role="option"
@@ -79,6 +93,10 @@ const StyledDisclosure = styled(Disclosure)`
   position: relative;
   left: auto;
   margin: 2px 0;
+
+  &&[aria-expanded="true"]:not(:hover) {
+    background: none;
+  }
 `;
 
 const Spacer = styled(Flex)<{ width: number }>`
@@ -130,4 +148,4 @@ export const Node = styled.span<{
   `}
 `;
 
-export default observer(React.forwardRef(DocumentExplorerNode));
+export default observer(DocumentExplorerNode);

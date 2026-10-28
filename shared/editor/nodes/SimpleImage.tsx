@@ -1,4 +1,4 @@
-import type { Token } from "markdown-it";
+import type Token from "markdown-it/lib/token.mjs";
 import { InputRule } from "prosemirror-inputrules";
 import type {
   Node as ProsemirrorNode,
@@ -10,10 +10,11 @@ import { TextSelection, NodeSelection } from "prosemirror-state";
 import * as React from "react";
 import type { Primitive } from "utility-types";
 import { getEventFiles } from "../../utils/files";
-import { sanitizeUrl } from "../../utils/urls";
+import { sanitizeImageSrc } from "../../utils/urls";
 import { AttachmentValidation } from "../../validations";
 import type { Options } from "../commands/insertFiles";
 import insertFiles from "../commands/insertFiles";
+import { selectBlockLikeVertically } from "../commands/selectBlockLikeVertically";
 import { default as ImageComponent } from "../components/Image";
 import type { MarkdownSerializerState } from "../lib/markdown/serializer";
 import uploadPlaceholderPlugin from "../lib/uploadPlaceholder";
@@ -29,6 +30,11 @@ export default class SimpleImage extends Node {
 
   get name() {
     return "image";
+  }
+
+  /** The component relies on load events to reveal the image, and `toDOM` already emits a plain img. */
+  get allowComponentInStaticHTML() {
+    return false;
   }
 
   get schema(): NodeSpec {
@@ -77,7 +83,7 @@ export default class SimpleImage extends Node {
           "img",
           {
             ...node.attrs,
-            src: sanitizeUrl(node.attrs.src),
+            src: sanitizeImageSrc(node.attrs.src),
             contentEditable: "false",
           },
         ],
@@ -90,8 +96,13 @@ export default class SimpleImage extends Node {
   handleClick =
     ({ view, getPos }: ComponentProps) =>
     () => {
+      const pos = getPos();
+      if (pos === undefined) {
+        return;
+      }
+
       this.editor.updateActiveLightboxImage(
-        LightboxImageFactory.createLightboxImage(view, getPos())
+        LightboxImageFactory.createLightboxImage(view, pos)
       );
     };
 
@@ -100,7 +111,10 @@ export default class SimpleImage extends Node {
   );
 
   keys(): Record<string, Command> {
+    const isImage = (node: ProsemirrorNode) => node.type.name === this.name;
     return {
+      ArrowUp: selectBlockLikeVertically(-1, isImage),
+      ArrowDown: selectBlockLikeVertically(1, isImage),
       Enter: (state, dispatch) => {
         const { selection } = state;
         if (
@@ -158,12 +172,8 @@ export default class SimpleImage extends Node {
         }
         const { view } = this.editor;
         const { node } = state.selection;
-        const {
-          uploadFile,
-          onFileUploadStart,
-          onFileUploadStop,
-          onFileUploadProgress,
-        } = this.editor.props;
+        const { uploadFile, onFileUploadStart, onFileUploadStop, onNotice } =
+          this.editor.props;
 
         if (!uploadFile) {
           throw new Error("uploadFile prop is required to replace images");
@@ -183,8 +193,7 @@ export default class SimpleImage extends Node {
             uploadFile,
             onFileUploadStart,
             onFileUploadStop,
-            onFileUploadProgress,
-            dictionary: this.options.dictionary,
+            onNotice,
             replaceExisting: true,
             attrs: {
               width: node.attrs.width,

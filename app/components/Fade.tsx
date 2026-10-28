@@ -12,13 +12,13 @@ const Fade = styled.span<{ timing?: number | string }>`
 `;
 
 type Props = {
-  children?: JSX.Element | null;
+  children?: React.JSX.Element | null;
   /** If true, children will be animated. */
   animate: boolean;
 };
 
 /**
- * Wraps children in a <Fade> if loading is true on mount.
+ * Wraps children in a <Fade> if animate is true on mount.
  */
 export const ConditionalFade = ({ animate, children }: Props) => {
   const [isAnimated] = useState(animate);

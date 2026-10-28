@@ -4,12 +4,11 @@ import filterExcessSeparators from "./filterExcessSeparators";
 const embedDescriptor = new EmbedDescriptor({
   id: "test",
   title: "Test",
-  icon: () => null,
   component: () => null,
 });
 
 describe("filterExcessSeparators", () => {
-  test("filter hanging end separators", () => {
+  it("filter hanging end separators", () => {
     expect(
       filterExcessSeparators([
         embedDescriptor,
@@ -21,7 +20,7 @@ describe("filterExcessSeparators", () => {
     ).toStrictEqual([embedDescriptor]);
   });
 
-  test("filter hanging start separators", () => {
+  it("filter hanging start separators", () => {
     expect(
       filterExcessSeparators([
         { name: "separator" },
@@ -33,7 +32,7 @@ describe("filterExcessSeparators", () => {
     ).toStrictEqual([embedDescriptor]);
   });
 
-  test("filter surrounding separators", () => {
+  it("filter surrounding separators", () => {
     expect(
       filterExcessSeparators([
         { name: "separator" },

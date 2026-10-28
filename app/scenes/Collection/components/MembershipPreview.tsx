@@ -1,4 +1,4 @@
-import sortBy from "lodash/sortBy";
+import { sortBy } from "es-toolkit/compat";
 import { observer } from "mobx-react";
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
@@ -91,7 +91,7 @@ const MembershipPreview = ({ collection, limit = 8 }: Props) => {
                 groupsCount,
                 count: groupsCount,
               }),
-        delay: 250,
+        delayDuration: 250,
       }}
       width="auto"
       height="auto"

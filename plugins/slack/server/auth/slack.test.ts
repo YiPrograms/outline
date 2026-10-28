@@ -1,3 +1,4 @@
+import { IntegrationType } from "@shared/types";
 import { buildUser } from "@server/test/factories";
 import { getTestServer } from "@server/test/support";
 import { parseEmail } from "@shared/utils/email";
@@ -8,18 +9,15 @@ describe("#slack.post", () => {
   it("should fail with status 400 bad request if query param state is not valid", async () => {
     const user = await buildUser();
     const res = await server.get(
-      `/auth/slack.post?state=${JSON.stringify(
-        {}
-      )}&code=123&token=${user.getJwtToken()}`
+      `/auth/slack.post?state=${JSON.stringify({})}&code=123`,
+      user
     );
     expect(res.status).toEqual(400);
   });
 
   it("should fail with status 400 bad request if query param state is not JSON", async () => {
     const user = await buildUser();
-    const res = await server.get(
-      `/auth/slack.post?state=bad&code=123&token=${user.getJwtToken()}`
-    );
+    const res = await server.get(`/auth/slack.post?state=bad&code=123`, user);
     expect(res.status).toEqual(400);
   });
 
@@ -30,6 +28,37 @@ describe("#slack.post", () => {
     const body = await res.json();
     expect(res.status).toEqual(400);
     expect(body.message).toEqual("query: one of code or error is required");
+  });
+
+  it("should reject callback when state nonce does not match cookie", async () => {
+    const user = await buildUser();
+    const state = JSON.stringify({
+      type: IntegrationType.LinkedAccount,
+      teamId: user.teamId,
+      nonce: "attacker-nonce",
+    });
+    const res = await server.get(
+      `/auth/slack.post?state=${encodeURIComponent(state)}&code=123`,
+      user,
+      { redirect: "manual" }
+    );
+    const body = await res.json();
+    expect(res.status).toEqual(400);
+    expect(body.error).toEqual("state_mismatch");
+  });
+
+  it("should reject callback when nonce is missing from state", async () => {
+    const user = await buildUser();
+    const state = JSON.stringify({
+      type: IntegrationType.LinkedAccount,
+      teamId: user.teamId,
+    });
+    const res = await server.get(
+      `/auth/slack.post?state=${encodeURIComponent(state)}&code=123`,
+      user,
+      { redirect: "manual" }
+    );
+    expect(res.status).toEqual(400);
   });
 });
 

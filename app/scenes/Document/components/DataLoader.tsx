@@ -1,9 +1,9 @@
 import { observer } from "mobx-react";
 import * as React from "react";
 import type { RouteComponentProps, StaticContext } from "react-router";
-import { useLocation } from "react-router";
-import { TeamPreference } from "@shared/types";
-import { ProsemirrorHelper } from "@shared/utils/ProsemirrorHelper";
+import { Redirect, useLocation } from "react-router";
+import { toError } from "@shared/utils/error";
+import { ProsemirrorDataHelper } from "@shared/utils/ProsemirrorDataHelper";
 import { RevisionHelper } from "@shared/utils/RevisionHelper";
 import type Document from "~/models/Document";
 import type Revision from "~/models/Revision";
@@ -13,11 +13,13 @@ import Error404 from "~/scenes/Errors/Error404";
 import ErrorOffline from "~/scenes/Errors/ErrorOffline";
 import ErrorUnknown from "~/scenes/Errors/ErrorUnknown";
 import { useDocumentContext } from "~/components/DocumentContext";
+import { useSplitView } from "~/components/SplitView/context";
 import useCurrentTeam from "~/hooks/useCurrentTeam";
 import useCurrentUser from "~/hooks/useCurrentUser";
 import usePolicy from "~/hooks/usePolicy";
 import useQuery from "~/hooks/useQuery";
 import useStores from "~/hooks/useStores";
+import { preloadEditor } from "~/routes/scenes";
 import type { Properties } from "~/types";
 import Logger from "~/utils/Logger";
 import {
@@ -27,7 +29,11 @@ import {
   PaymentRequiredError,
 } from "~/utils/errors";
 import history from "~/utils/history";
-import { matchDocumentEdit, settingsPath } from "~/utils/routeHelpers";
+import {
+  matchDocumentEdit,
+  settingsPath,
+  updateDocumentPath,
+} from "~/utils/routeHelpers";
 import useDocumentSidebar from "../hooks/useDocumentSidebar";
 import Loading from "./Loading";
 import MarkAsViewed from "./MarkAsViewed";
@@ -62,7 +68,8 @@ type Props = RouteComponentProps<Params, StaticContext, LocationState> & {
 };
 
 function DataLoader({ match, children }: Props) {
-  const { ui, views, shares, comments, documents, revisions } = useStores();
+  const { ui, views, shares, comments, documents, revisions, collections } =
+    useStores();
   const team = useCurrentTeam();
   const user = useCurrentUser();
   const { setDocument } = useDocumentContext();
@@ -87,12 +94,22 @@ function DataLoader({ match, children }: Props) {
   const isEditRoute =
     match.path === matchDocumentEdit || match.path.startsWith(settingsPath());
   const isEditing = isEditRoute || !user?.separateEditMode;
+  const { isFocused: isPaneFocused } = useSplitView();
   const can = usePolicy(document);
   const location = useLocation<LocationState>();
   const query = useQuery();
   const missingPolicy = !can || Object.keys(can).length === 0;
+  const isJustCreated = React.useMemo(
+    () => !!document?.isJustCreated,
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
+    [document?.id]
+  );
 
   useDocumentSidebar();
+
+  React.useEffect(() => {
+    preloadEditor();
+  }, []);
 
   React.useEffect(() => {
     async function fetchDocument() {
@@ -101,46 +118,80 @@ function DataLoader({ match, children }: Props) {
           force: missingPolicy,
         });
       } catch (err) {
-        setError(err);
+        setError(toError(err));
       }
     }
     void fetchDocument();
   }, [ui, documents, missingPolicy, documentSlug]);
 
-  React.useEffect(() => {
-    async function fetchRevision() {
-      if (!revisionId) {
-        return;
-      }
+  const fetchRevisionById = React.useCallback(
+    async (id: string, onError: (err: Error) => void) => {
       try {
-        if (revisionId === "latest") {
+        if (id === "latest") {
           if (document?.id) {
             await revisions.fetchLatest(document.id);
           }
         } else {
-          await revisions.fetch(revisionId);
+          await revisions.fetch(id);
         }
       } catch (err) {
-        setError(err);
+        onError(err as Error);
       }
+    },
+    [revisions, document?.id]
+  );
+
+  React.useEffect(() => {
+    setError(null);
+    if (revisionId) {
+      void fetchRevisionById(revisionId, setError);
     }
-    void fetchRevision();
-  }, [revisions, revisionId, document?.id]);
+  }, [fetchRevisionById, revisionId]);
+
+  const compareTo = query.get("compareTo");
+
+  React.useEffect(() => {
+    if (compareTo) {
+      void fetchRevisionById(compareTo, (err) =>
+        Logger.error("Failed to fetch compareTo revision", err)
+      );
+    }
+  }, [fetchRevisionById, compareTo]);
 
   React.useEffect(() => {
     async function fetchViews() {
-      if (document?.id && !document?.isDeleted && !revisionId) {
+      if (
+        document?.id &&
+        !document?.isDeleted &&
+        !revisionId &&
+        !isJustCreated
+      ) {
         try {
           await views.fetchPage({
             documentId: document.id,
           });
         } catch (err) {
-          Logger.error("Failed to fetch views", err);
+          Logger.error("Failed to fetch views", toError(err));
         }
       }
     }
     void fetchViews();
-  }, [document?.id, document?.isDeleted, revisionId, views]);
+  }, [document?.id, document?.isDeleted, revisionId, views, isJustCreated]);
+
+  // The collection tree provides the child documents list, so load it here
+  // rather than relying on the sidebar having rendered the collection.
+  const collectionId = document?.collectionId;
+  React.useEffect(() => {
+    if (!collectionId) {
+      return;
+    }
+    void collections
+      .fetch(collectionId)
+      .then((collection) => collection.fetchDocuments())
+      .catch((err) =>
+        Logger.error("Failed to fetch collection documents", toError(err))
+      );
+  }, [collections, collectionId]);
 
   const onCreateLink = React.useCallback(
     async (params: Properties<Document>, nested?: boolean) => {
@@ -152,7 +203,7 @@ function DataLoader({ match, children }: Props) {
         {
           collectionId: nested ? undefined : document.collectionId,
           parentDocumentId: nested ? document.id : document.parentDocumentId,
-          data: ProsemirrorHelper.getEmptyDocument(),
+          data: ProsemirrorDataHelper.getEmpty(),
           ...params,
         },
         {
@@ -165,11 +216,17 @@ function DataLoader({ match, children }: Props) {
     [document, documents]
   );
 
+  // Sets the current document as active in the sidebar. In a split view only
+  // the focused pane's document is active, updated as focus moves between the
+  // panes.
+  React.useEffect(() => {
+    if (document && isPaneFocused) {
+      ui.setActiveDocument(document);
+    }
+  }, [ui, document, isPaneFocused]);
+
   React.useEffect(() => {
     if (document) {
-      // sets the current document as active in the sidebar
-      ui.setActiveDocument(document);
-
       // If we're attempting to update an archived, deleted, or otherwise
       // uneditable document then forward to the canonical read url.
       if (!missingPolicy && !can.update && isEditRoute) {
@@ -180,7 +237,7 @@ function DataLoader({ match, children }: Props) {
       // Prevents unauthorized request to load share information for the document
       // when viewing a public share link
       if (can.read && !document.isDeleted && !revisionId) {
-        if (team.getPreference(TeamPreference.Commenting)) {
+        if (team.commentingEnabled && !isJustCreated) {
           void comments.fetchAll({
             documentId: document.id,
             limit: 100,
@@ -188,11 +245,15 @@ function DataLoader({ match, children }: Props) {
           });
         }
 
-        shares.fetchOne({ documentId: document.id }).catch((err) => {
-          if (!(err instanceof NotFoundError)) {
-            throw err;
-          }
-        });
+        // A newly created document has no share of its own, though it can still inherit one
+        // from a parent.
+        if (!isJustCreated || document.parentDocumentId) {
+          shares.fetchOne({ documentId: document.id }).catch((err) => {
+            if (!(err instanceof NotFoundError)) {
+              throw err;
+            }
+          });
+        }
       }
     }
   }, [
@@ -203,8 +264,9 @@ function DataLoader({ match, children }: Props) {
     comments,
     team,
     shares,
-    ui,
     revisionId,
+    missingPolicy,
+    isJustCreated,
   ]);
 
   // Auto-enter presentation mode when ?present=true query param is set
@@ -220,7 +282,7 @@ function DataLoader({ match, children }: Props) {
     ) : error instanceof PaymentRequiredError ? (
       <Error402 />
     ) : error instanceof AuthorizationError ? (
-      <Error403 />
+      <Error403 documentId={documentSlug} />
     ) : error instanceof NotFoundError ? (
       <Error404 />
     ) : (
@@ -240,11 +302,21 @@ function DataLoader({ match, children }: Props) {
     );
   }
 
+  const canonicalUrl = updateDocumentPath(match.url, document);
   const canEdit = can.update && !document.isArchived && !revisionId;
   const readOnly = !isEditing || !canEdit;
 
   return (
     <>
+      {location.pathname !== canonicalUrl && (
+        <Redirect
+          to={{
+            pathname: canonicalUrl,
+            state: location.state,
+            hash: location.hash,
+          }}
+        />
+      )}
       {!revision && <MarkAsViewed document={document} />}
       <React.Fragment key={canEdit ? "edit" : "read"}>
         {children({

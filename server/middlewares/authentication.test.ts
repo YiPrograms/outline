@@ -1,4 +1,5 @@
 import type { DefaultState } from "koa";
+import { errToString } from "@shared/utils/error";
 import { randomString } from "@shared/random";
 import { Scope } from "@shared/types";
 import {
@@ -8,6 +9,7 @@ import {
   buildApiKey,
   buildOAuthAuthentication,
 } from "@server/test/factories";
+import { buildMockContext } from "@server/test/support";
 import { AuthenticationType } from "@server/types";
 import auth from "./authentication";
 
@@ -18,15 +20,14 @@ describe("Authentication middleware", () => {
       const user = await buildUser();
       const authMiddleware = auth();
       await authMiddleware(
-        {
-          // @ts-expect-error mock request
+        buildMockContext({
           request: {
-            get: jest.fn(() => `Bearer ${user.getJwtToken()}`),
+            get: vi.fn(() => `Bearer ${user.getSessionToken()}`),
           },
           state,
           cache: {},
-        },
-        jest.fn()
+        }),
+        vi.fn()
       );
       expect(state.auth.user.id).toEqual(user.id);
     });
@@ -38,18 +39,17 @@ describe("Authentication middleware", () => {
 
       try {
         await authMiddleware(
-          {
-            // @ts-expect-error mock request
+          buildMockContext({
             request: {
-              get: jest.fn(() => `Bearer ${user.getJwtToken()}error`),
+              get: vi.fn(() => `Bearer ${user.getSessionToken()}error`),
             },
             state,
             cache: {},
-          },
-          jest.fn()
+          }),
+          vi.fn()
         );
       } catch (e) {
-        expect(e.message).toBe("Invalid token");
+        expect(errToString(e)).toBe("Invalid token");
       }
     });
 
@@ -62,18 +62,17 @@ describe("Authentication middleware", () => {
 
       try {
         await authMiddleware(
-          {
-            // @ts-expect-error mock request
+          buildMockContext({
             request: {
-              get: jest.fn(() => `Bearer ${user.getJwtToken()}`),
+              get: vi.fn(() => `Bearer ${user.getSessionToken()}`),
             },
             state,
             cache: {},
-          },
-          jest.fn()
+          }),
+          vi.fn()
         );
       } catch (e) {
-        expect(e.message).toBe("Invalid authentication type");
+        expect(errToString(e)).toBe("Invalid authentication type");
       }
     });
   });
@@ -85,36 +84,90 @@ describe("Authentication middleware", () => {
       const authMiddleware = auth();
       const key = await buildApiKey({ userId: user.id });
       await authMiddleware(
-        {
-          // @ts-expect-error mock request
+        buildMockContext({
           request: {
-            get: jest.fn(() => `Bearer ${key.value}`),
+            get: vi.fn(() => `Bearer ${key.value}`),
           },
           state,
           cache: {},
-        },
-        jest.fn()
+        }),
+        vi.fn()
       );
       expect(state.auth.user.id).toEqual(user.id);
     });
+    it("should authenticate with global read scope on read endpoints", async () => {
+      const state = {} as DefaultState;
+      const user = await buildUser();
+      const authMiddleware = auth();
+      const key = await buildApiKey({
+        userId: user.id,
+        scope: [Scope.Read],
+      });
+
+      await authMiddleware(
+        buildMockContext({
+          originalUrl: "/api/auth.info",
+          request: {
+            url: "/auth.info",
+            get: vi.fn(() => `Bearer ${key.value}`),
+          },
+          state,
+          cache: {},
+        }),
+        vi.fn()
+      );
+      expect(state.auth.user.id).toEqual(user.id);
+    });
+
+    it("should return 403 authorization error when scope does not match", async () => {
+      const state = {} as DefaultState;
+      const user = await buildUser();
+      const authMiddleware = auth();
+      const key = await buildApiKey({
+        userId: user.id,
+        scope: [Scope.Read],
+      });
+
+      try {
+        await authMiddleware(
+          buildMockContext({
+            originalUrl: "/api/documents.create",
+            request: {
+              url: "/documents.create",
+              get: vi.fn(() => `Bearer ${key.value}`),
+            },
+            state,
+            cache: {},
+          }),
+          vi.fn()
+        );
+        throw new Error("Expected error to be thrown");
+      } catch (e) {
+        expect(e).toHaveProperty("status", 403);
+        expect(e).toHaveProperty("id", "authorization_error");
+        expect(errToString(e)).toContain(
+          "does not have access to this resource"
+        );
+      }
+    });
+
     it("should return error with invalid API key", async () => {
       const state = {} as DefaultState;
       const authMiddleware = auth();
 
       try {
         await authMiddleware(
-          {
-            // @ts-expect-error mock request
+          buildMockContext({
             request: {
-              get: jest.fn(() => `Bearer ${randomString(38)}`),
+              get: vi.fn(() => `Bearer ${randomString(38)}`),
             },
             state,
             cache: {},
-          },
-          jest.fn()
+          }),
+          vi.fn()
         );
       } catch (e) {
-        expect(e.message).toBe("Invalid API key");
+        expect(errToString(e)).toBe("Invalid API key");
       }
     });
   });
@@ -130,17 +183,16 @@ describe("Authentication middleware", () => {
       });
 
       await authMiddleware(
-        {
+        buildMockContext({
           originalUrl: "/api/users.info",
-          // @ts-expect-error mock request
           request: {
             url: "/users.info",
-            get: jest.fn(() => `Bearer ${authentication.accessToken}`),
+            get: vi.fn(() => `Bearer ${authentication.accessToken}`),
           },
           state,
           cache: {},
-        },
-        jest.fn()
+        }),
+        vi.fn()
       );
       expect(state.auth.user.id).toEqual(user.id);
     });
@@ -156,20 +208,21 @@ describe("Authentication middleware", () => {
 
       try {
         await authMiddleware(
-          {
+          buildMockContext({
             originalUrl: "/api/documents.create",
-            // @ts-expect-error mock request
             request: {
               url: "/documents.create",
-              get: jest.fn(() => `Bearer ${authentication.accessToken}`),
+              get: vi.fn(() => `Bearer ${authentication.accessToken}`),
             },
             state,
             cache: {},
-          },
-          jest.fn()
+          }),
+          vi.fn()
         );
       } catch (e) {
-        expect(e.message).toContain("does not have access to this resource");
+        expect(errToString(e)).toContain(
+          "does not have access to this resource"
+        );
       }
     });
 
@@ -183,23 +236,22 @@ describe("Authentication middleware", () => {
       });
       try {
         await authMiddleware(
-          {
+          buildMockContext({
             originalUrl: "/api/users.info",
             request: {
               url: "/users.info",
-              // @ts-expect-error mock request
-              get: jest.fn(() => null),
+              get: vi.fn(() => null),
               body: {
                 token: authentication.accessToken,
               },
             },
             state,
             cache: {},
-          },
-          jest.fn()
+          }),
+          vi.fn()
         );
       } catch (e) {
-        expect(e.message).toContain(
+        expect(errToString(e)).toContain(
           "must be passed in the Authorization header"
         );
       }
@@ -212,61 +264,106 @@ describe("Authentication middleware", () => {
 
     try {
       await authMiddleware(
-        {
-          // @ts-expect-error mock request
+        buildMockContext({
           request: {
-            get: jest.fn(() => "error"),
+            get: vi.fn(() => "error"),
           },
           state,
           cache: {},
-        },
-        jest.fn()
+        }),
+        vi.fn()
       );
     } catch (e) {
-      expect(e.message).toBe(
+      expect(errToString(e)).toBe(
         'Bad Authorization header format. Format is "Authorization: Bearer <token>"'
       );
     }
   });
 
-  it("should allow passing auth token as a GET param", async () => {
+  it("should allow passing session token in a cookie", async () => {
     const state = {} as DefaultState;
     const user = await buildUser();
     const authMiddleware = auth();
     await authMiddleware(
-      {
+      buildMockContext({
         request: {
-          // @ts-expect-error mock request
-          get: jest.fn(() => null),
-          query: {
-            token: user.getJwtToken(),
-          },
+          get: vi.fn(() => null),
+        },
+        cookies: {
+          get: vi.fn(() => user.getSessionToken()),
         },
         state,
         cache: {},
-      },
-      jest.fn()
+      }),
+      vi.fn()
     );
     expect(state.auth.user.id).toEqual(user.id);
   });
 
-  it("should allow passing auth token in body params", async () => {
+  it("should return error with session token as a GET param", async () => {
+    const state = {} as DefaultState;
+    const user = await buildUser();
+    const authMiddleware = auth();
+
+    await expect(
+      authMiddleware(
+        buildMockContext({
+          request: {
+            get: vi.fn(() => null),
+            query: {
+              token: user.getSessionToken(),
+            },
+          },
+          state,
+          cache: {},
+        }),
+        vi.fn()
+      )
+    ).rejects.toThrow(
+      "Session token must be passed in the cookie or Authorization header"
+    );
+  });
+
+  it("should return error with session token in body params", async () => {
+    const state = {} as DefaultState;
+    const user = await buildUser();
+    const authMiddleware = auth();
+
+    await expect(
+      authMiddleware(
+        buildMockContext({
+          request: {
+            get: vi.fn(() => null),
+            body: {
+              token: user.getSessionToken(),
+            },
+          },
+          state,
+          cache: {},
+        }),
+        vi.fn()
+      )
+    ).rejects.toThrow(
+      "Session token must be passed in the cookie or Authorization header"
+    );
+  });
+
+  it("should allow passing transfer token as a GET param", async () => {
     const state = {} as DefaultState;
     const user = await buildUser();
     const authMiddleware = auth();
     await authMiddleware(
-      {
+      buildMockContext({
         request: {
-          // @ts-expect-error mock request
-          get: jest.fn(() => null),
-          body: {
-            token: user.getJwtToken(),
+          get: vi.fn(() => null),
+          query: {
+            token: user.getTransferToken(),
           },
         },
         state,
         cache: {},
-      },
-      jest.fn()
+      }),
+      vi.fn()
     );
     expect(state.auth.user.id).toEqual(user.id);
   });
@@ -283,24 +380,23 @@ describe("Authentication middleware", () => {
 
     try {
       await authMiddleware(
-        {
-          // @ts-expect-error mock request
+        buildMockContext({
           request: {
-            get: jest.fn(() => `Bearer ${user.getJwtToken()}`),
+            get: vi.fn(() => `Bearer ${user.getSessionToken()}`),
           },
           state,
           cache: {},
-        },
-        jest.fn()
+        }),
+        vi.fn()
       );
     } catch (err) {
       error = err;
     }
 
-    expect(error.message).toEqual(
+    expect(errToString(error)).toEqual(
       "Your access has been suspended by a workspace admin"
     );
-    expect(error.errorData.adminEmail).toEqual(admin.email);
+    expect(error).toHaveProperty("errorData.adminEmail", admin.email);
   });
 
   it("should return an error for deleted team", async () => {
@@ -313,20 +409,71 @@ describe("Authentication middleware", () => {
 
     try {
       await authMiddleware(
-        {
-          // @ts-expect-error mock request
+        buildMockContext({
           request: {
-            get: jest.fn(() => `Bearer ${user.getJwtToken()}`),
+            get: vi.fn(() => `Bearer ${user.getSessionToken()}`),
           },
           state,
           cache: {},
-        },
-        jest.fn()
+        }),
+        vi.fn()
       );
     } catch (err) {
       error = err;
     }
 
-    expect(error.message).toEqual("Invalid token");
+    expect(errToString(error)).toEqual("Invalid token");
+  });
+  describe("with skip", () => {
+    it("should ignore credentials when skip returns true", async () => {
+      const state = {} as DefaultState;
+      const user = await buildUser();
+      const apiKey = await buildApiKey({
+        userId: user.id,
+        scope: ["/api/documents.info"],
+      });
+      const next = vi.fn();
+      const authMiddleware = auth({
+        optional: true,
+        skip: (ctx) => !!ctx.query.sig,
+      });
+      await authMiddleware(
+        buildMockContext({
+          request: {
+            get: vi.fn(() => `Bearer ${apiKey.value}`),
+          },
+          query: { sig: "signature" },
+          originalUrl: "/api/files.get?sig=signature",
+          state,
+          cache: {},
+        }),
+        next
+      );
+      expect(next).toHaveBeenCalled();
+      expect(state.auth).toEqual({});
+    });
+
+    it("should authenticate when skip returns false", async () => {
+      const state = {} as DefaultState;
+      const user = await buildUser();
+      const next = vi.fn();
+      const authMiddleware = auth({
+        optional: true,
+        skip: (ctx) => !!ctx.query.sig,
+      });
+      await authMiddleware(
+        buildMockContext({
+          request: {
+            get: vi.fn(() => `Bearer ${user.getSessionToken()}`),
+          },
+          query: {},
+          state,
+          cache: {},
+        }),
+        next
+      );
+      expect(next).toHaveBeenCalled();
+      expect(state.auth.user.id).toEqual(user.id);
+    });
   });
 });

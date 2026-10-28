@@ -1,4 +1,4 @@
-import Router from "koa-router";
+import Router from "@koa/router";
 import type { WhereOptions } from "sequelize";
 import { Transaction } from "sequelize";
 import { QueryNotices } from "@shared/types";
@@ -15,6 +15,7 @@ import { authorize } from "@server/policies";
 import { presentSubscription } from "@server/presenters";
 import type { APIContext } from "@server/types";
 import { RateLimiterStrategy } from "@server/utils/RateLimiter";
+import { safeEqual } from "@server/utils/crypto";
 import pagination from "../middlewares/pagination";
 import * as T from "./schema";
 
@@ -46,6 +47,7 @@ router.post(
       // documentId will be available here
       const document = await Document.findByPk(documentId!, {
         userId: user.id,
+        includeContent: false,
       });
       authorize(user, "read", document);
 
@@ -90,6 +92,7 @@ router.post(
       // documentId will be available here
       const document = await Document.findByPk(documentId!, {
         userId: user.id,
+        includeContent: false,
       });
       authorize(user, "read", document);
 
@@ -114,6 +117,7 @@ router.post(
 
 router.post(
   "subscriptions.create",
+  rateLimiter(RateLimiterStrategy.TwentyFivePerMinute),
   auth(),
   validate(T.SubscriptionsCreateSchema),
   transaction(),
@@ -121,19 +125,20 @@ router.post(
     const { user } = ctx.state.auth;
     const { event, collectionId, documentId } = ctx.input.body;
 
+    if (documentId) {
+      const document = await Document.findByPk(documentId, {
+        userId: user.id,
+      });
+
+      authorize(user, "subscribe", document);
+    }
+
     if (collectionId) {
       const collection = await Collection.findByPk(collectionId, {
         userId: user.id,
       });
 
       authorize(user, "subscribe", collection);
-    } else {
-      // documentId will be available here
-      const document = await Document.findByPk(documentId!, {
-        userId: user.id,
-      });
-
-      authorize(user, "subscribe", document);
     }
 
     const subscription = await subscriptionCreator({
@@ -169,33 +174,33 @@ router.get(
       documentId
     );
 
-    if (unsubscribeToken !== token) {
+    if (!safeEqual(unsubscribeToken, token)) {
       ctx.redirect(`${env.URL}?notice=invalid-auth`);
       return;
     }
 
-    const [documentSubscription, document, user] = await Promise.all([
-      Subscription.findOne({
-        where: {
-          userId,
-          documentId,
-        },
-        lock: Transaction.LOCK.UPDATE,
-        transaction,
-      }),
-      Document.unscoped().findOne({
-        attributes: ["collectionId"],
-        where: {
-          id: documentId,
-        },
-        paranoid: false,
-        transaction,
-      }),
-      User.scope("withTeam").findByPk(userId, {
-        rejectOnEmpty: true,
-        transaction,
-      }),
-    ]);
+    // Queries within a transaction share a single connection, so they are run
+    // sequentially rather than with Promise.all.
+    const documentSubscription = await Subscription.findOne({
+      where: {
+        userId,
+        documentId,
+      },
+      lock: Transaction.LOCK.UPDATE,
+      transaction,
+    });
+    const document = await Document.unscoped().findOne({
+      attributes: ["collectionId"],
+      where: {
+        id: documentId,
+      },
+      paranoid: false,
+      transaction,
+    });
+    const user = await User.scope("withTeam").findByPk(userId, {
+      rejectOnEmpty: true,
+      transaction,
+    });
 
     const context = createContext({
       user,

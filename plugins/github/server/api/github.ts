@@ -1,17 +1,21 @@
-import Router from "koa-router";
-import find from "lodash/find";
+import Router from "@koa/router";
+import { find } from "es-toolkit/compat";
 import { IntegrationService, IntegrationType } from "@shared/types";
 import { createContext } from "@server/context";
+import { ValidationError } from "@server/errors";
 import apexAuthRedirect from "@server/middlewares/apexAuthRedirect";
 import auth from "@server/middlewares/authentication";
 import { transaction } from "@server/middlewares/transaction";
 import validate from "@server/middlewares/validate";
 import validateWebhook from "@server/middlewares/validateWebhook";
 import { IntegrationAuthentication, Integration } from "@server/models";
+import { authorize } from "@server/policies";
 import type { APIContext } from "@server/types";
-import { GitHubUtils } from "../../shared/GitHubUtils";
+import { verifyOAuthStateNonce } from "@server/utils/oauth";
+import { RequestHelper } from "@server/utils/RequestHelper";
+import { GitHubOAuthNonceCookie, GitHubUtils } from "../../shared/GitHubUtils";
 import env from "../env";
-import { GitHub } from "../github";
+import { GitHub, InstallationAccess } from "../github";
 import GitHubWebhookTask from "../tasks/GitHubWebhookTask";
 import * as T from "./schema";
 
@@ -22,7 +26,7 @@ router.get(
   auth({ optional: true }),
   validate(T.GitHubCallbackSchema),
   apexAuthRedirect<T.GitHubCallbackReq>({
-    getTeamId: (ctx) => ctx.input.query.state,
+    getTeamId: (ctx) => GitHubUtils.parseState(ctx.input.query.state)?.teamId,
     getRedirectPath: (ctx, team) =>
       GitHubUtils.callbackUrl({
         baseUrl: team.url,
@@ -34,7 +38,7 @@ router.get(
   async (ctx: APIContext<T.GitHubCallbackReq>) => {
     const {
       code,
-      state: teamId,
+      state,
       error,
       installation_id: installationId,
       setup_action: setupAction,
@@ -52,7 +56,15 @@ router.get(
       return;
     }
 
-    const client = await GitHub.authenticateAsUser(code!, teamId);
+    const parsedState = GitHubUtils.parseState(state);
+    if (!parsedState) {
+      throw ValidationError("Invalid state");
+    }
+
+    verifyOAuthStateNonce(ctx, GitHubOAuthNonceCookie, parsedState.nonce);
+    authorize(user, "createIntegration", user.team);
+
+    const client = await GitHub.authenticateAsUser(code!, state);
     const installationsByUser = await client.requestAppInstallations();
     const installation = find(
       installationsByUser,
@@ -63,8 +75,13 @@ router.get(
       return ctx.redirect(GitHubUtils.errorUrl("unauthenticated"));
     }
 
+    const access = await GitHub.canManageInstallation(client, installation);
+    if (access !== InstallationAccess.Allowed) {
+      return ctx.redirect(GitHubUtils.errorUrl(access));
+    }
+
     const scopes = Object.entries(installation.permissions).map(
-      ([name, permission]) => `${name}:${permission}`
+      ([name, permission]) => `${name}:${String(permission)}`
     );
 
     const authentication = await IntegrationAuthentication.create(
@@ -88,7 +105,6 @@ router.get(
             id: installationId!,
             account: {
               id: installation.account?.id,
-              // @ts-expect-error Property 'login' does not exist on type
               name: installation.account?.login,
               avatarUrl: installation.account?.avatar_url,
             },
@@ -114,7 +130,8 @@ router.post(
     },
   }),
   async (ctx: APIContext) => {
-    const { headers, body } = ctx.request;
+    const { headers } = ctx.request;
+    const body = RequestHelper.getBodyObject(ctx.request);
 
     await new GitHubWebhookTask().schedule({
       payload: body,

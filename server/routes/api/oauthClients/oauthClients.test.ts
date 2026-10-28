@@ -1,5 +1,15 @@
+import { randomUUID } from "node:crypto";
+import { http, HttpResponse } from "msw";
+import { TeamPreference } from "@shared/types";
 import { OAuthClient } from "@server/models";
-import { buildTeam, buildUser, buildAdmin } from "@server/test/factories";
+import { server as msw } from "@server/test/msw";
+import {
+  buildApiKey,
+  buildMetadataDocumentOAuthClient,
+  buildTeam,
+  buildUser,
+  buildAdmin,
+} from "@server/test/factories";
 import { getTestServer } from "@server/test/support";
 
 const server = getTestServer();
@@ -41,11 +51,7 @@ describe("oauthClients.list", () => {
       published: false,
     });
 
-    const res = await server.post("/api/oauthClients.list", {
-      body: {
-        token: admin.getJwtToken(),
-      },
-    });
+    const res = await server.post("/api/oauthClients.list", admin);
 
     const body = await res.json();
     expect(res.status).toEqual(200);
@@ -56,6 +62,21 @@ describe("oauthClients.list", () => {
     ]);
     expect(body.data[0].id).toBeDefined();
     expect(body.data[0].redirectUris).toBeDefined();
+  });
+});
+
+describe("oauthClients.list metadata documents", () => {
+  it("should not include metadata document clients", async () => {
+    const admin = await buildAdmin();
+    const client = await buildMetadataDocumentOAuthClient();
+
+    const res = await server.post("/api/oauthClients.list", admin);
+    const body = await res.json();
+
+    expect(res.status).toEqual(200);
+    expect(
+      body.data.map((c: { clientId: string }) => c.clientId)
+    ).not.toContain(client.clientId);
   });
 });
 
@@ -78,9 +99,8 @@ describe("oauthClients.info", () => {
       redirectUris: ["https://example.com/callback"],
     });
 
-    const res = await server.post("/api/oauthClients.info", {
+    const res = await server.post("/api/oauthClients.info", user, {
       body: {
-        token: user.getJwtToken(),
         id: client.id,
       },
     });
@@ -94,6 +114,55 @@ describe("oauthClients.info", () => {
     expect(body.data.redirectUris).toEqual(["https://example.com/callback"]);
   });
 
+  it("should not return the client secret to a read-only credential", async () => {
+    const team = await buildTeam();
+    const user = await buildAdmin({ teamId: team.id });
+    const apiKey = await buildApiKey({ userId: user.id, scope: ["read"] });
+
+    const client = await OAuthClient.create({
+      teamId: team.id,
+      createdById: user.id,
+      name: "Test Client",
+      redirectUris: ["https://example.com/callback"],
+    });
+
+    const res = await server.post("/api/oauthClients.info", {
+      headers: { authorization: `Bearer ${apiKey.value}` },
+      body: {
+        id: client.id,
+      },
+    });
+
+    const body = await res.json();
+    expect(res.status).toEqual(200);
+    expect(body.data.name).toEqual("Test Client");
+    expect(body.data.clientSecret).toBeUndefined();
+  });
+
+  it("should return the client secret to a write credential", async () => {
+    const team = await buildTeam();
+    const user = await buildAdmin({ teamId: team.id });
+    const apiKey = await buildApiKey({ userId: user.id, scope: ["write"] });
+
+    const client = await OAuthClient.create({
+      teamId: team.id,
+      createdById: user.id,
+      name: "Test Client",
+      redirectUris: ["https://example.com/callback"],
+    });
+
+    const res = await server.post("/api/oauthClients.info", {
+      headers: { authorization: `Bearer ${apiKey.value}` },
+      body: {
+        id: client.id,
+      },
+    });
+
+    const body = await res.json();
+    expect(res.status).toEqual(200);
+    expect(body.data.clientSecret).toEqual(client.clientSecret);
+  });
+
   it("should return basic information about an OAuth client when member", async () => {
     const team = await buildTeam();
     const user = await buildUser({ teamId: team.id });
@@ -105,9 +174,8 @@ describe("oauthClients.info", () => {
       redirectUris: ["https://example.com/callback"],
     });
 
-    const res = await server.post("/api/oauthClients.info", {
+    const res = await server.post("/api/oauthClients.info", user, {
       body: {
-        token: user.getJwtToken(),
         id: client.id,
       },
     });
@@ -132,9 +200,8 @@ describe("oauthClients.info", () => {
       published: true,
     });
 
-    const res = await server.post("/api/oauthClients.info", {
+    const res = await server.post("/api/oauthClients.info", user, {
       body: {
-        token: user.getJwtToken(),
         id: client.id,
       },
     });
@@ -160,9 +227,8 @@ describe("oauthClients.info", () => {
       published: true,
     });
 
-    const res = await server.post("/api/oauthClients.info", {
+    const res = await server.post("/api/oauthClients.info", user, {
       body: {
-        token: user.getJwtToken(),
         clientId: client.clientId,
       },
     });
@@ -173,6 +239,71 @@ describe("oauthClients.info", () => {
     expect(body.data.published).toBeTruthy();
     expect(body.data.id).toBeUndefined();
     expect(body.data.redirectUris).toBeUndefined();
+  });
+
+  it("should fetch a client by its metadata document URL", async () => {
+    const user = await buildUser();
+    const clientId = `https://${randomUUID()}.example.com/oauth/client.json`;
+    msw.use(
+      http.get(clientId, () =>
+        HttpResponse.json({
+          client_id: clientId,
+          client_name: "Example MCP Client",
+          redirect_uris: ["https://example.com/callback"],
+        })
+      )
+    );
+
+    const res = await server.post("/api/oauthClients.info", user, {
+      body: {
+        clientId,
+        redirectUri: "https://example.com/callback",
+      },
+    });
+
+    const body = await res.json();
+    expect(res.status).toEqual(200);
+    expect(body.data.name).toEqual("Example MCP Client");
+    expect(body.data.clientId).toEqual(clientId);
+    expect(body.data.clientSecret).toBeUndefined();
+    expect(body.policies).toEqual([]);
+  });
+
+  it("should not fetch a metadata document when MCP is disabled", async () => {
+    const team = await buildTeam({
+      preferences: { [TeamPreference.MCP]: false },
+    });
+    const user = await buildUser({ teamId: team.id });
+    const clientId = `https://${randomUUID()}.example.com/oauth/client.json`;
+    let requests = 0;
+    msw.use(
+      http.get(clientId, () => {
+        requests++;
+        return new HttpResponse(null, { status: 404 });
+      })
+    );
+
+    const res = await server.post("/api/oauthClients.info", user, {
+      body: { clientId },
+    });
+
+    expect(res.status).toEqual(403);
+    expect(requests).toEqual(0);
+  });
+
+  it("should return a distinct error when a metadata document cannot be fetched", async () => {
+    const user = await buildUser();
+    const clientId = `https://${randomUUID()}.example.com/oauth/client.json`;
+    msw.use(http.get(clientId, () => new HttpResponse(null, { status: 404 })));
+
+    const res = await server.post("/api/oauthClients.info", user, {
+      body: { clientId },
+    });
+
+    const body = await res.json();
+    expect(res.status).toEqual(422);
+    expect(body.error).toEqual("invalid_client_metadata");
+    expect(body.message).toContain("status 404");
   });
 
   it("should validate redirectUri parameter", async () => {
@@ -192,9 +323,8 @@ describe("oauthClients.info", () => {
     });
 
     // Test with valid redirectUri
-    const validRes = await server.post("/api/oauthClients.info", {
+    const validRes = await server.post("/api/oauthClients.info", user, {
       body: {
-        token: user.getJwtToken(),
         clientId: client.clientId,
         redirectUri: "https://example.com/callback",
       },
@@ -205,9 +335,8 @@ describe("oauthClients.info", () => {
     expect(validBody.data.name).toEqual("Test Client");
 
     // Test with invalid redirectUri
-    const invalidRes = await server.post("/api/oauthClients.info", {
+    const invalidRes = await server.post("/api/oauthClients.info", user, {
       body: {
-        token: user.getJwtToken(),
         clientId: client.clientId,
         redirectUri: "https://malicious.com/callback",
       },
@@ -228,9 +357,8 @@ describe("oauthClients.create", () => {
     const team = await buildTeam();
     const admin = await buildAdmin({ teamId: team.id });
 
-    const res = await server.post("/api/oauthClients.create", {
+    const res = await server.post("/api/oauthClients.create", admin, {
       body: {
-        token: admin.getJwtToken(),
         name: "Test Client",
         redirectUris: ["https://example.com/callback"],
       },
@@ -241,6 +369,25 @@ describe("oauthClients.create", () => {
     expect(body.data.id).toBeDefined();
     expect(body.data.name).toEqual("Test Client");
     expect(body.data.redirectUris).toEqual(["https://example.com/callback"]);
+  });
+
+  it("should reject duplicate redirect uris", async () => {
+    const team = await buildTeam();
+    const admin = await buildAdmin({ teamId: team.id });
+
+    const res = await server.post("/api/oauthClients.create", admin, {
+      body: {
+        name: "Test Client",
+        redirectUris: [
+          "https://example.com/callback",
+          "https://example.com/callback",
+        ],
+      },
+    });
+
+    const body = await res.json();
+    expect(res.status).toEqual(400);
+    expect(body.message).toContain("Must not contain duplicate urls");
   });
 });
 
@@ -264,9 +411,8 @@ describe("oauthclients.update", () => {
       published: true,
     });
 
-    const res = await server.post("/api/oauthClients.update", {
+    const res = await server.post("/api/oauthClients.update", admin, {
       body: {
-        token: admin.getJwtToken(),
         id: client.id,
         published: false,
         name: "Renamed",
@@ -301,9 +447,8 @@ describe("oauthClients.rotate_secret", () => {
 
     const originalSecret = client.clientSecret;
 
-    const res = await server.post("/api/oauthClients.rotate_secret", {
+    const res = await server.post("/api/oauthClients.rotate_secret", admin, {
       body: {
-        token: admin.getJwtToken(),
         id: client.id,
       },
     });
@@ -335,9 +480,8 @@ describe("oauthClients.delete", () => {
       redirectUris: ["https://example.com/callback"],
     });
 
-    const res = await server.post("/api/oauthClients.delete", {
+    const res = await server.post("/api/oauthClients.delete", admin, {
       body: {
-        token: admin.getJwtToken(),
         id: client.id,
       },
     });

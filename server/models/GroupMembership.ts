@@ -5,6 +5,7 @@ import {
   type FindOptions,
   type DestroyOptions,
   type WhereOptions,
+  type Transaction,
 } from "sequelize";
 import {
   BelongsTo,
@@ -24,15 +25,16 @@ import {
 import type { DocumentPermission } from "@shared/types";
 import { CollectionPermission } from "@shared/types";
 import { ValidationError } from "@server/errors";
+import { LockHelper } from "@server/storage/LockHelper";
 import type { APIContext } from "@server/types";
 import Collection from "./Collection";
 import Document from "./Document";
 import Group from "./Group";
+import GroupUser from "./GroupUser";
 import User from "./User";
 import UserMembership from "./UserMembership";
 import { type HookContext } from "./base/Model";
 import ParanoidModel from "./base/ParanoidModel";
-import Fix from "./decorators/Fix";
 
 /**
  * Represents a group's permission to access a collection or document.
@@ -71,7 +73,6 @@ import Fix from "./decorators/Fix";
   },
 }))
 @Table({ tableName: "group_permissions", modelName: "group_permission" })
-@Fix
 class GroupMembership extends ParanoidModel<
   InferAttributes<GroupMembership>,
   Partial<InferCreationAttributes<GroupMembership>>
@@ -136,6 +137,38 @@ class GroupMembership extends ParanoidModel<
   // static methods
 
   /**
+   * Find the membership of a group on a collection or document and lock it for
+   * the remainder of the transaction. The lock is held even when no membership
+   * exists, so that concurrent grants cannot each create a membership.
+   *
+   * @param where the group and the collection or document of the membership.
+   * @param options additional options to pass to the query, with a transaction.
+   * @returns a promise that resolves to the membership, or null.
+   */
+  public static async findOneForUpdate(
+    where: {
+      groupId: string;
+      collectionId?: string | null;
+      documentId?: string | null;
+    },
+    options: FindOptions<GroupMembership> & { transaction: Transaction }
+  ) {
+    const { groupId, collectionId, documentId } = where;
+    const targetId = collectionId ?? documentId;
+    await LockHelper.acquire(
+      this.sequelize!,
+      `groupMembership:${targetId}:${groupId}`.toLowerCase(),
+      options.transaction
+    );
+
+    return this.findOne({
+      ...options,
+      where: collectionId ? { groupId, collectionId } : { groupId, documentId },
+      lock: options.transaction.LOCK.UPDATE,
+    });
+  }
+
+  /**
    * Copy group memberships from one document to another.
    *
    * @param where The where clause to find the group memberships to copy.
@@ -192,7 +225,7 @@ class GroupMembership extends ParanoidModel<
       memberships.map((membership) =>
         membership?.sourceId
           ? this.findByPk(membership.sourceId, options)
-          : membership
+          : Promise.resolve(membership)
       )
     );
 
@@ -204,7 +237,10 @@ class GroupMembership extends ParanoidModel<
   @AfterCreate
   static async createSourcedMemberships(
     model: GroupMembership,
-    options: SaveOptions<GroupMembership> & { documentId?: string }
+    options: SaveOptions<GroupMembership> & {
+      documentId?: string;
+      childDocumentIds?: string[];
+    }
   ) {
     if (model.sourceId || !model.documentId) {
       return;
@@ -222,6 +258,11 @@ class GroupMembership extends ParanoidModel<
       membershipId: model.id,
       isNew: true,
     });
+  }
+
+  @AfterCreate
+  static async invalidateDocumentIdsAfterCreate(model: GroupMembership) {
+    await model.invalidateMembershipDocumentIds();
   }
 
   @AfterUpdate
@@ -321,34 +362,46 @@ class GroupMembership extends ParanoidModel<
     });
   }
 
+  @AfterDestroy
+  static async invalidateDocumentIdsAfterDestroy(model: GroupMembership) {
+    await model.invalidateMembershipDocumentIds();
+  }
+
   /**
    * Recreate all sourced permissions for a given permission.
+   *
+   * @param model the source membership.
+   * @param options the save options, with an optional target document id and
+   * precomputed published child document ids of the target document.
    */
   static async recreateSourcedMemberships(
     model: GroupMembership,
-    options: SaveOptions<GroupMembership> & { documentId?: string }
+    options: SaveOptions<GroupMembership> & {
+      documentId?: string;
+      childDocumentIds?: string[];
+    }
   ) {
     if (!model.documentId) {
       return;
     }
     const { transaction, documentId } = options;
+    let { childDocumentIds } = options;
 
-    const document = await Document.unscoped()
-      .scope("withoutState")
-      .findOne({
-        attributes: ["id"],
-        where: {
-          id: documentId ?? model.documentId,
-        },
-        transaction,
-      });
-    if (!document) {
-      return;
-    }
+    if (!childDocumentIds) {
+      const document = await Document.unscoped()
+        .scope("withoutState")
+        .findOne({
+          attributes: ["id"],
+          where: {
+            id: documentId ?? model.documentId,
+          },
+          transaction,
+        });
+      if (!document) {
+        return;
+      }
 
-    const childDocumentIds = [
-      ...(documentId ? [documentId] : []),
-      ...(await document.findAllChildDocumentIds(
+      childDocumentIds = await document.findAllChildDocumentIds(
         {
           publishedAt: {
             [Op.ne]: null,
@@ -357,39 +410,62 @@ class GroupMembership extends ParanoidModel<
         {
           transaction,
         }
-      )),
-    ];
-
-    if (childDocumentIds.length) {
-      await this.destroy({
-        where: {
-          groupId: model.groupId,
-          sourceId: model.id,
-          documentId: {
-            [Op.in]: childDocumentIds,
-          },
-        },
-        transaction,
-      });
-    }
-
-    for (const childDocumentId of childDocumentIds) {
-      await this.create(
-        {
-          documentId: childDocumentId,
-          groupId: model.groupId,
-          permission: model.permission,
-          sourceId: model.id,
-          createdById: model.createdById,
-          createdAt: model.createdAt,
-          updatedAt: model.updatedAt,
-        },
-        {
-          transaction,
-          hooks: false,
-        }
       );
     }
+
+    const documentIds = [
+      ...(documentId ? [documentId] : []),
+      ...childDocumentIds,
+    ];
+    if (!documentIds.length) {
+      return;
+    }
+
+    await this.destroy({
+      where: {
+        groupId: model.groupId,
+        sourceId: model.id,
+        documentId: {
+          [Op.in]: documentIds,
+        },
+      },
+      transaction,
+    });
+
+    await this.bulkCreate(
+      documentIds.map((childDocumentId) => ({
+        documentId: childDocumentId,
+        groupId: model.groupId,
+        permission: model.permission,
+        sourceId: model.id,
+        createdById: model.createdById,
+        createdAt: model.createdAt,
+        updatedAt: model.updatedAt,
+      })),
+      {
+        transaction,
+        hooks: false,
+      }
+    );
+  }
+
+  /**
+   * Invalidates the cached document membership IDs of every user in the group,
+   * as a document granted to a group is reachable by all of its members.
+   */
+  private async invalidateMembershipDocumentIds() {
+    if (!this.documentId) {
+      return;
+    }
+
+    const groupUsers = await GroupUser.findAll({
+      attributes: ["userId"],
+      where: { groupId: this.groupId },
+    });
+
+    await Document.invalidateMembershipDocumentIds(
+      groupUsers.map((groupUser) => groupUser.userId)
+    );
   }
 
   private async insertEvent(
@@ -413,6 +489,15 @@ class GroupMembership extends ParanoidModel<
     model: GroupMembership,
     { transaction }: APIContext["context"]
   ) {
+    // Both models guard the same invariant, so they share one lock name,
+    // otherwise the last user manager and the last group manager can be
+    // removed at the same time.
+    await LockHelper.acquire(
+      model.sequelize,
+      `collectionAdmins:${model.collectionId}`,
+      transaction
+    );
+
     const [userMemberships, groupMemberships] = await Promise.all([
       UserMembership.count({
         where: {

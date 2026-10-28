@@ -1,5 +1,5 @@
 import type { InferAttributes, InferCreationAttributes } from "sequelize";
-import { Op } from "sequelize";
+import { Op, Sequelize } from "sequelize";
 import {
   BelongsTo,
   Column,
@@ -18,7 +18,7 @@ import Team from "./Team";
 import User from "./User";
 import ParanoidModel from "./base/ParanoidModel";
 import { CounterCache } from "./decorators/CounterCache";
-import Fix from "./decorators/Fix";
+import IsHexColor from "./validators/IsHexColor";
 import Length from "./validators/Length";
 import NotContainsUrl from "./validators/NotContainsUrl";
 
@@ -39,16 +39,22 @@ import NotContainsUrl from "./validators/NotContainsUrl";
   tableName: "groups",
   modelName: "group",
   validate: {
-    async isUniqueNameInTeam() {
+    // Group names must be unique within the team, ignoring case. Groups synced
+    // from an external provider are scoped by their externalId, since providers
+    // can legitimately report several groups with the same name.
+    async isUniqueNameInTeam(this: Group) {
       const foundItem = await Group.findOne({
+        attributes: ["id"],
         where: {
           teamId: this.teamId,
-          name: {
-            [Op.iLike]: this.name,
-          },
+          externalId: this.externalId ?? null,
           id: {
             [Op.not]: this.id,
           },
+          [Op.and]: Sequelize.where(
+            Sequelize.fn("lower", Sequelize.col("name")),
+            (this.name ?? "").toLowerCase()
+          ),
         },
       });
 
@@ -58,14 +64,17 @@ import NotContainsUrl from "./validators/NotContainsUrl";
     },
   },
 })
-@Fix
 class Group extends ParanoidModel<
   InferAttributes<Group>,
   Partial<InferCreationAttributes<Group>>
 > {
-  @Length({ min: 0, max: 255, msg: "name must be 255 characters or less" })
+  @Length({
+    min: 0,
+    max: GroupValidation.maxNameLength,
+    msg: `name must be ${GroupValidation.maxNameLength} characters or less`,
+  })
   @NotContainsUrl
-  @Column
+  @Column(DataType.STRING)
   name: string;
 
   @Length({
@@ -76,7 +85,16 @@ class Group extends ParanoidModel<
   @Column(DataType.TEXT)
   description: string;
 
-  @Column
+  /** An icon (or) emoji to use as the group icon. */
+  @Column(DataType.STRING)
+  icon: string | null;
+
+  /** The color of the icon. */
+  @IsHexColor
+  @Column(DataType.STRING)
+  color: string | null;
+
+  @Column(DataType.STRING)
   externalId: string;
 
   @Column(DataType.BOOLEAN)
@@ -116,7 +134,20 @@ class Group extends ParanoidModel<
   @BelongsToMany(() => User, () => GroupUser)
   users: User[];
 
-  @CounterCache(() => GroupUser, { as: "members", foreignKey: "groupId" })
+  @CounterCache(() => GroupUser, {
+    as: "members",
+    foreignKey: "groupId",
+    include: [
+      {
+        association: "user",
+        required: true,
+        attributes: [],
+        where: {
+          suspendedAt: { [Op.is]: null },
+        },
+      },
+    ],
+  })
   memberCount: Promise<number>;
 }
 

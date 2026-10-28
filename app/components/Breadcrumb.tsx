@@ -2,7 +2,7 @@ import { GoToIcon } from "outline-icons";
 import { observer } from "mobx-react";
 import * as React from "react";
 import { Link } from "react-router-dom";
-import styled from "styled-components";
+import styled, { css } from "styled-components";
 import { s, ellipsis } from "@shared/styles";
 import Flex from "~/components/Flex";
 import BreadcrumbMenu from "~/menus/BreadcrumbMenu";
@@ -20,12 +20,16 @@ type Props = React.PropsWithChildren<{
   actions: InternalLinkAction[];
   max?: number;
   highlightFirstItem?: boolean;
+  ref?: React.Ref<HTMLDivElement>;
 }>;
 
-function Breadcrumb(
-  { actions, highlightFirstItem, children, max = 2 }: Props,
-  ref: React.RefObject<HTMLDivElement> | null
-) {
+function Breadcrumb({
+  actions,
+  highlightFirstItem,
+  children,
+  max = 2,
+  ref,
+}: Props) {
   const actionContext = useActionContext({ isMenu: true });
 
   const visibleActions = useComputed(
@@ -55,6 +59,15 @@ function Breadcrumb(
     });
   }
 
+  const handleClick = React.useCallback(
+    (event: React.MouseEvent<HTMLAnchorElement>) => {
+      if (event.currentTarget.querySelector('[data-state="open"]')) {
+        event.preventDefault();
+      }
+    },
+    []
+  );
+
   const toBreadcrumb = React.useCallback(
     (action: TopLevelAction, index: number) => {
       if (action.type === "menu") {
@@ -62,21 +75,26 @@ function Breadcrumb(
       }
 
       const item = actionToMenuItem(action, actionContext) as MenuInternalLink;
+      const highlight = !!highlightFirstItem && index === 0;
+
+      // Items without a destination are shown as plain text.
+      if (!item.to) {
+        return (
+          <StaticItem $highlight={highlight}>
+            {item.icon}
+            <Title>{item.title}</Title>
+          </StaticItem>
+        );
+      }
 
       return (
-        <>
+        <Item to={item.to} onClick={handleClick} $highlight={highlight}>
           {item.icon}
-          <Item
-            to={item.to}
-            $withIcon={!!item.icon}
-            $highlight={!!highlightFirstItem && index === 0}
-          >
-            {item.title}
-          </Item>
-        </>
+          <Title>{item.title}</Title>
+        </Item>
       );
     },
-    [actionContext, highlightFirstItem]
+    [actionContext, handleClick, highlightFirstItem]
   );
 
   return (
@@ -99,27 +117,48 @@ const Slash = styled(GoToIcon)`
   fill: ${s("divider")};
 `;
 
-const Item = styled(Link)<{ $highlight: boolean; $withIcon: boolean }>`
-  ${ellipsis()}
+const itemStyles = css<{ $highlight: boolean }>`
   ${undraggableOnDesktop()}
 
   display: flex;
+  align-items: center;
+  gap: 4px;
   flex-shrink: 1;
   min-width: 0;
-  cursor: var(--pointer);
   color: ${s("text")};
   font-size: 15px;
-  height: 24px;
+  height: 32px;
   font-weight: ${(props) => (props.$highlight ? "500" : "inherit")};
-  margin-left: ${(props) => (props.$withIcon ? "4px" : "0")};
+  padding-inline: 8px;
+  border-radius: 4px;
+  margin-inline: -4px;
 
-  svg {
-    flex-shrink: 0;
+  &:first-child {
+    margin-inline-start: 0;
   }
+  max-width: 460px;
+`;
 
-  &:hover {
-    text-decoration: underline;
+const Item = styled(Link)<{ $highlight: boolean }>`
+  ${itemStyles}
+  cursor: var(--pointer);
+  transition: background 100ms ease-in-out;
+
+  &:hover,
+  &:has([data-state="open"]) {
+    background: ${s("buttonNeutralHoverBackground")};
+    transition: none;
   }
 `;
 
-export default observer(React.forwardRef<HTMLDivElement, Props>(Breadcrumb));
+const StaticItem = styled.span<{ $highlight: boolean }>`
+  ${itemStyles}
+  cursor: default;
+`;
+
+const Title = styled.span`
+  ${ellipsis()}
+  min-width: 0;
+`;
+
+export default observer(Breadcrumb);

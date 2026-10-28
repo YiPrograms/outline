@@ -6,10 +6,11 @@ import styled from "styled-components";
 import { s, ellipsis } from "@shared/styles";
 import Button from "~/components/Button";
 import Flex from "~/components/Flex";
+import { HEADER_HEIGHT } from "~/components/Header";
 import { PortalContext } from "~/components/Portal";
 import { RightSidebarWrappedContext } from "~/components/RightSidebarContext";
 import Scrollable from "~/components/Scrollable";
-import RightSidebar from "~/components/Sidebar/Right";
+import Aside from "~/components/Sidebar/Aside";
 import Tooltip from "~/components/Tooltip";
 import {
   Drawer,
@@ -79,12 +80,16 @@ function SidebarLayout({ title, onClose, children, scrollable = true }: Props) {
     return inner;
   }
 
-  return <RightSidebar>{inner}</RightSidebar>;
+  return <Aside>{inner}</Aside>;
 }
 
 const ForwardIcon = styled(BackIcon)`
   transform: rotate(180deg);
   flex-shrink: 0;
+
+  [dir="rtl"] & {
+    transform: rotate(0deg);
+  }
 `;
 
 const Title = styled(Flex)`
@@ -103,7 +108,9 @@ const Header = styled(Flex)`
   ${draggableOnDesktop()}
   align-items: center;
   position: relative;
-  padding: 16px 12px 16px 16px;
+  padding-block: 12px;
+  padding-inline: 16px 12px;
+  min-height: ${HEADER_HEIGHT}px;
   color: ${s("text")};
   flex-shrink: 0;
 `;

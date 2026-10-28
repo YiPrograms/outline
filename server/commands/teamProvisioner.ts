@@ -9,7 +9,10 @@ import {
 import Logger from "@server/logging/Logger";
 import { traceFunction } from "@server/logging/tracing";
 import { Team, AuthenticationProvider } from "@server/models";
-import { sequelize } from "@server/storage/database";
+import {
+  retryOnUniqueConstraintError,
+  sequelize,
+} from "@server/storage/database";
 import type { APIContext } from "@server/types";
 
 type TeamProvisionerResult = {
@@ -45,31 +48,48 @@ async function teamProvisioner(
   ctx: APIContext,
   { teamId, name, domain, subdomain, avatarUrl, authenticationProvider }: Props
 ): Promise<TeamProvisionerResult> {
+  const where = teamId
+    ? { ...authenticationProvider, teamId }
+    : authenticationProvider;
+
+  // First try to find an authentication provider associated with a non-deleted
+  // team. This ensures active workspaces are always preferred over deleted ones
+  // when multiple workspaces share the same authentication provider.
   let authP = await AuthenticationProvider.findOne({
-    where: teamId
-      ? { ...authenticationProvider, teamId }
-      : authenticationProvider,
+    where,
     include: [
       {
         model: Team,
         as: "team",
         required: true,
-        paranoid: false,
       },
     ],
-    order: [
-      [Team, "deletedAt", "DESC"],
-      ["enabled", "DESC"],
-    ],
+    order: [["enabled", "DESC"]],
   });
+
+  if (!authP) {
+    // Check if there is a matching authentication provider for a deleted team.
+    // If so, throw an appropriate error rather than creating a new team.
+    authP = await AuthenticationProvider.findOne({
+      where,
+      include: [
+        {
+          model: Team,
+          as: "team",
+          required: true,
+          paranoid: false,
+        },
+      ],
+    });
+
+    if (authP?.team.deletedAt) {
+      throw TeamPendingDeletionError();
+    }
+  }
 
   // This authentication provider already exists which means we have a team and
   // there is nothing left to do but return the existing credentials
   if (authP) {
-    if (authP.team.deletedAt) {
-      throw TeamPendingDeletionError();
-    }
-
     return {
       authenticationProvider: authP,
       team: authP.team,
@@ -111,15 +131,19 @@ async function teamProvisioner(
     throw InvalidAuthenticationError();
   }
 
-  // We cannot find an existing team, so we create a new one
-  const team = await sequelize.transaction((transaction) =>
-    teamCreator(createContext({ transaction }), {
-      name,
-      domain,
-      subdomain,
-      avatarUrl,
-      authenticationProviders: [authenticationProvider],
-    })
+  // We cannot find an existing team, so we create a new one. Two concurrent
+  // signups can pick the same available subdomain, so retry on a conflict –
+  // the next attempt will see the committed team and choose another.
+  const team = await retryOnUniqueConstraintError(() =>
+    sequelize.transaction((transaction) =>
+      teamCreator(createContext({ transaction }), {
+        name,
+        domain,
+        subdomain,
+        avatarUrl,
+        authenticationProviders: [authenticationProvider],
+      })
+    )
   );
 
   return {

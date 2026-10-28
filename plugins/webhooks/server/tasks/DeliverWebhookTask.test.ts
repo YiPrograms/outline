@@ -1,23 +1,99 @@
-import fetchMock from "jest-fetch-mock";
-import { WebhookDelivery } from "@server/models";
+import { FetchError } from "node-fetch";
 import {
+  http,
+  HttpResponse,
+  type DefaultBodyType,
+  type StrictRequest,
+} from "msw";
+import { server } from "@server/test/msw";
+import { Revision, WebhookDelivery } from "@server/models";
+import {
+  buildCollection,
+  buildComment,
+  buildDocument,
+  buildPersonalCollection,
   buildUser,
   buildWebhookDelivery,
   buildWebhookSubscription,
 } from "@server/test/factories";
-import type { UserEvent } from "@server/types";
-import DeliverWebhookTask from "./DeliverWebhookTask";
-
-beforeEach(async () => {
-  jest.resetAllMocks();
-  fetchMock.resetMocks();
-  fetchMock.doMock();
-});
+import type {
+  CommentEvent,
+  DocumentEvent,
+  RevisionEvent,
+  UserEvent,
+} from "@server/types";
+import DeliverWebhookTask, {
+  isExpectedNetworkError,
+} from "./DeliverWebhookTask";
 
 const ip = "127.0.0.1";
 
+type CapturedRequest = {
+  request: StrictRequest<DefaultBodyType>;
+  body: string;
+};
+
+const captureWebhook = (
+  url: string,
+  response: () => Response = () => new HttpResponse(null, { status: 200 })
+) => {
+  const captured: CapturedRequest[] = [];
+  server.use(
+    http.post(url, async ({ request }) => {
+      const cloned = request.clone();
+      captured.push({ request, body: await cloned.text() });
+      return response();
+    })
+  );
+  return captured;
+};
+
 describe("DeliverWebhookTask", () => {
-  test("should hit the subscription url and record a delivery", async () => {
+  it("should not deliver events in a personal collection", async () => {
+    const owner = await buildUser();
+    const subscription = await buildWebhookSubscription({
+      teamId: owner.teamId,
+      createdById: owner.id,
+      url: "http://example.com",
+      events: ["*"],
+    });
+    const previous = await buildCollection({
+      teamId: owner.teamId,
+      userId: owner.id,
+    });
+    const personal = await buildPersonalCollection(owner);
+    const document = await buildDocument({
+      teamId: owner.teamId,
+      userId: owner.id,
+      collectionId: personal.id,
+    });
+    const captured = captureWebhook("http://example.com");
+
+    // The event was queued before the document moved to the personal collection.
+    const event: DocumentEvent = {
+      name: "documents.update",
+      documentId: document.id,
+      collectionId: previous.id,
+      teamId: owner.teamId,
+      actorId: owner.id,
+      ip,
+      createdAt: new Date().toISOString(),
+      data: { done: true },
+    };
+    await new DeliverWebhookTask().perform({
+      subscriptionId: subscription.id,
+      event,
+    });
+
+    expect(captured.length).toBe(0);
+    expect(
+      await WebhookDelivery.count({
+        where: { webhookSubscriptionId: subscription.id },
+      })
+    ).toBe(0);
+  });
+
+  it("should hit the subscription url and record a delivery", async () => {
     const subscription = await buildWebhookSubscription({
       url: "http://example.com",
       events: ["*"],
@@ -25,7 +101,10 @@ describe("DeliverWebhookTask", () => {
     const signedInUser = await buildUser({ teamId: subscription.teamId });
     const processor = new DeliverWebhookTask();
 
-    fetchMock.mockResponse("SUCCESS", { status: 200 });
+    const captured = captureWebhook(
+      "http://example.com",
+      () => new HttpResponse("SUCCESS", { status: 200 })
+    );
 
     const event: UserEvent = {
       name: "users.signin",
@@ -39,14 +118,9 @@ describe("DeliverWebhookTask", () => {
       event,
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://example.com",
-      expect.anything()
-    );
-    const parsedBody = JSON.parse(
-      fetchMock.mock.calls[0]![1]!.body!.toString()
-    );
+    expect(captured.length).toBe(1);
+    expect(captured[0].request.url).toBe("http://example.com/");
+    const parsedBody = JSON.parse(captured[0].body);
     expect(parsedBody.webhookSubscriptionId).toBe(subscription.id);
     expect(parsedBody.event).toBe("users.signin");
     expect(parsedBody.payload.id).toBe(signedInUser.id);
@@ -63,7 +137,7 @@ describe("DeliverWebhookTask", () => {
     expect(delivery.responseBody).toEqual("SUCCESS");
   });
 
-  test("should hit the subscription url with signature header", async () => {
+  it("should hit the subscription url with signature header", async () => {
     const subscription = await buildWebhookSubscription({
       url: "http://example.com",
       events: ["*"],
@@ -71,6 +145,8 @@ describe("DeliverWebhookTask", () => {
     });
     const signedInUser = await buildUser({ teamId: subscription.teamId });
     const processor = new DeliverWebhookTask();
+
+    const captured = captureWebhook("http://example.com");
 
     const event: UserEvent = {
       name: "users.signin",
@@ -84,16 +160,96 @@ describe("DeliverWebhookTask", () => {
       event,
     });
 
-    const headers = fetchMock.mock.calls[0]![1]!.headers! as Record<
-      string,
-      string
-    >;
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(headers["Outline-Signature"]).toMatch(/^t=[0-9]+,s=[a-z0-9]+$/);
+    expect(captured.length).toBe(1);
+    expect(captured[0].request.headers.get("Outline-Signature")).toMatch(
+      /^t=[0-9]+,s=[a-z0-9]+$/
+    );
   });
 
-  test("should hit the subscription url when the eventing model doesn't exist", async () => {
+  it("should include the document collectionId in comment events", async () => {
+    const user = await buildUser();
+    const subscription = await buildWebhookSubscription({
+      teamId: user.teamId,
+      createdById: user.id,
+      url: "http://example.com",
+      events: ["*"],
+    });
+    const collection = await buildCollection({
+      teamId: user.teamId,
+      userId: user.id,
+    });
+    const document = await buildDocument({
+      teamId: user.teamId,
+      userId: user.id,
+      collectionId: collection.id,
+    });
+    const comment = await buildComment({
+      userId: user.id,
+      documentId: document.id,
+    });
+    const captured = captureWebhook("http://example.com");
+
+    const event: CommentEvent = {
+      name: "comments.create",
+      modelId: comment.id,
+      documentId: document.id,
+      teamId: user.teamId,
+      actorId: user.id,
+      ip,
+    };
+    await new DeliverWebhookTask().perform({
+      subscriptionId: subscription.id,
+      event,
+    });
+
+    expect(captured.length).toBe(1);
+    const parsedBody = JSON.parse(captured[0].body);
+    expect(parsedBody.payload.id).toBe(comment.id);
+    expect(parsedBody.payload.model.collectionId).toBe(collection.id);
+    expect(parsedBody.payload.model.documentId).toBe(document.id);
+  });
+
+  it("should include the document collectionId in revision events", async () => {
+    const user = await buildUser();
+    const subscription = await buildWebhookSubscription({
+      teamId: user.teamId,
+      createdById: user.id,
+      url: "http://example.com",
+      events: ["*"],
+    });
+    const collection = await buildCollection({
+      teamId: user.teamId,
+      userId: user.id,
+    });
+    const document = await buildDocument({
+      teamId: user.teamId,
+      userId: user.id,
+      collectionId: collection.id,
+    });
+    const revision = await Revision.buildFromDocument(document).save();
+    const captured = captureWebhook("http://example.com");
+
+    const event: RevisionEvent = {
+      name: "revisions.create",
+      modelId: revision.id,
+      documentId: document.id,
+      teamId: user.teamId,
+      actorId: user.id,
+      ip,
+    };
+    await new DeliverWebhookTask().perform({
+      subscriptionId: subscription.id,
+      event,
+    });
+
+    expect(captured.length).toBe(1);
+    const parsedBody = JSON.parse(captured[0].body);
+    expect(parsedBody.payload.id).toBe(revision.id);
+    expect(parsedBody.payload.model.collectionId).toBe(collection.id);
+    expect(parsedBody.payload.model.documentId).toBe(document.id);
+  });
+
+  it("should hit the subscription url when the eventing model doesn't exist", async () => {
     const subscription = await buildWebhookSubscription({
       url: "http://example.com",
       events: ["*"],
@@ -110,19 +266,16 @@ describe("DeliverWebhookTask", () => {
       ip,
     };
 
+    const captured = captureWebhook("http://example.com");
+
     await task.perform({
       event,
       subscriptionId: subscription.id,
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://example.com",
-      expect.anything()
-    );
-    const parsedBody = JSON.parse(
-      fetchMock.mock.calls[0]![1]!.body!.toString()
-    );
+    expect(captured.length).toBe(1);
+    expect(captured[0].request.url).toBe("http://example.com/");
+    const parsedBody = JSON.parse(captured[0].body);
     expect(parsedBody.webhookSubscriptionId).toBe(subscription.id);
     expect(parsedBody.event).toBe("users.delete");
     expect(parsedBody.payload.id).toBe(deletedUserId);
@@ -138,13 +291,16 @@ describe("DeliverWebhookTask", () => {
     expect(delivery.responseBody).toBeDefined();
   });
 
-  test("should mark delivery as failed if post fails", async () => {
+  it("should mark delivery as failed if post fails", async () => {
     const subscription = await buildWebhookSubscription({
       url: "http://example.com",
       events: ["*"],
     });
 
-    fetchMock.mockResponse("FAILED", { status: 500 });
+    captureWebhook(
+      "http://example.com",
+      () => new HttpResponse("FAILED", { status: 500 })
+    );
 
     const signedInUser = await buildUser({ teamId: subscription.teamId });
     const task = new DeliverWebhookTask();
@@ -178,7 +334,7 @@ describe("DeliverWebhookTask", () => {
     expect(delivery.responseBody).toEqual("FAILED");
   });
 
-  test("should disable the subscription if past deliveries failed", async () => {
+  it("should disable the subscription if past deliveries failed", async () => {
     const subscription = await buildWebhookSubscription({
       url: "http://example.com",
       events: ["*"],
@@ -190,9 +346,9 @@ describe("DeliverWebhookTask", () => {
       });
     }
 
-    fetchMock.mockResponse(JSON.stringify({ message: "Failure" }), {
-      status: 500,
-    });
+    captureWebhook("http://example.com", () =>
+      HttpResponse.json({ message: "Failure" }, { status: 500 })
+    );
 
     const signedInUser = await buildUser({ teamId: subscription.teamId });
     const task = new DeliverWebhookTask();
@@ -224,5 +380,65 @@ describe("DeliverWebhookTask", () => {
     expect(delivery.status).toBe("failed");
     expect(delivery.statusCode).toBe(500);
     expect(delivery.responseBody).toEqual('{"message":"Failure"}');
+  });
+});
+
+describe("isExpectedNetworkError", () => {
+  it("treats node-fetch FetchError as expected", () => {
+    expect(
+      isExpectedNetworkError(
+        new FetchError("request to https://example.com failed", "system")
+      )
+    ).toBe(true);
+  });
+
+  it("treats raw socket errors as expected", () => {
+    expect(isExpectedNetworkError(new Error("socket hang up"))).toBe(true);
+    expect(
+      isExpectedNetworkError(
+        Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })
+      )
+    ).toBe(true);
+  });
+
+  it("treats connection error codes as expected", () => {
+    for (const code of [
+      "ECONNREFUSED",
+      "ETIMEDOUT",
+      "EHOSTUNREACH",
+      "ENOTFOUND",
+      "EAI_AGAIN",
+    ]) {
+      expect(
+        isExpectedNetworkError(Object.assign(new Error("boom"), { code }))
+      ).toBe(true);
+    }
+  });
+
+  it("treats invalid certificate errors as expected", () => {
+    expect(
+      isExpectedNetworkError(
+        Object.assign(new Error("self signed certificate"), {
+          code: "DEPTH_ZERO_SELF_SIGNED_CERT",
+        })
+      )
+    ).toBe(true);
+  });
+
+  it("treats the request timeout thrown by the fetch wrapper as expected", () => {
+    expect(
+      isExpectedNetworkError(new Error("Request timeout after 5000ms"))
+    ).toBe(true);
+  });
+
+  it("does not treat unrelated errors as expected", () => {
+    expect(
+      isExpectedNetworkError(new TypeError("undefined is not a function"))
+    ).toBe(false);
+    expect(
+      isExpectedNetworkError(new Error("Cannot read property foo of undefined"))
+    ).toBe(false);
+    expect(isExpectedNetworkError("socket hang up")).toBe(false);
+    expect(isExpectedNetworkError(undefined)).toBe(false);
   });
 });

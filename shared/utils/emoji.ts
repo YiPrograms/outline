@@ -2,8 +2,7 @@ import RawData from "@emoji-mart/data";
 import type { EmojiMartData, Skin } from "@emoji-mart/data";
 import { init, Data } from "emoji-mart";
 import FuzzySearch from "fuzzy-search";
-import capitalize from "lodash/capitalize";
-import sortBy from "lodash/sortBy";
+import { capitalize, sortBy } from "es-toolkit/compat";
 import type { Emoji, EmojiVariants } from "../types";
 import { EmojiCategory, EmojiSkinTone } from "../types";
 
@@ -29,7 +28,6 @@ const isFlagEmojiSupported = (): boolean => {
     const CANVAS_WIDTH = 20;
     const textSize = Math.floor(CANVAS_HEIGHT / 2);
 
-    // Initialize canvas context
     ctx.font = textSize + "px Arial, Sans-Serif";
     ctx.textBaseline = "top";
     ctx.canvas.width = CANVAS_WIDTH * 2;

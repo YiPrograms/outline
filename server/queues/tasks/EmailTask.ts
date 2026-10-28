@@ -3,7 +3,7 @@ import { BaseTask } from "./base/BaseTask";
 
 type Props = {
   templateName: string;
-  props: Record<string, any>;
+  props: Record<string, unknown>;
 };
 
 export default class EmailTask extends BaseTask<Props> {
@@ -15,7 +15,6 @@ export default class EmailTask extends BaseTask<Props> {
       );
     }
 
-    // @ts-expect-error We won't instantiate an abstract class
     const email = new EmailClass(props, metadata);
     return email.send();
   }

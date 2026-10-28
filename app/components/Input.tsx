@@ -2,15 +2,20 @@ import * as VisuallyHidden from "@radix-ui/react-visually-hidden";
 import * as React from "react";
 import { mergeRefs } from "react-merge-refs";
 import styled from "styled-components";
-import breakpoint from "styled-components-breakpoint";
+import { breakpoint } from "@shared/styles/breakpoint";
+import { MOBILE_TOUCH_TARGET } from "@shared/constants";
 import { s, ellipsis } from "@shared/styles";
 import Flex from "~/components/Flex";
 import Text from "~/components/Text";
+import Fade from "~/components/Fade";
 import { undraggableOnDesktop } from "~/styles";
 
 export const NativeTextarea = styled.textarea<{
   hasIcon?: boolean;
   hasPrefix?: boolean;
+  $autoSize?: boolean;
+  $minHeight?: string;
+  $maxHeight?: string;
 }>`
   border: 0;
   flex: 1;
@@ -19,6 +24,10 @@ export const NativeTextarea = styled.textarea<{
   outline: none;
   background: none;
   color: ${s("text")};
+
+  ${(props) => props.$autoSize && `field-sizing: content;`}
+  ${(props) => props.$minHeight && `min-height: ${props.$minHeight};`}
+  ${(props) => props.$maxHeight && `max-height: ${props.$maxHeight};`}
 
   &:disabled,
   &::placeholder {
@@ -67,6 +76,7 @@ export const NativeInput = styled.input<{
 
   ${breakpoint("mobile", "tablet")`
     font-size: 16px;
+    height: ${MOBILE_TOUCH_TARGET - 2}px;
   `};
 `;
 
@@ -87,7 +97,7 @@ export const Wrapper = styled.div<{
 
 const IconWrapper = styled.span`
   position: relative;
-  left: 4px;
+  inset-inline-start: 4px;
   width: 24px;
   height: 24px;
 `;
@@ -96,7 +106,9 @@ export const Outline = styled(Flex)<{
   margin?: string | number;
   hasError?: boolean;
   $focused?: boolean;
+  $round?: boolean;
 }>`
+  position: relative;
   flex: 1;
   margin: ${(props) =>
     props.margin !== undefined ? props.margin : "0 0 16px"};
@@ -109,14 +121,37 @@ export const Outline = styled(Flex)<{
       : props.$focused
         ? props.theme.inputBorderFocused
         : props.theme.inputBorder};
-  border-radius: 4px;
+  border-radius: ${(props) => (props.$round ? "16px" : "4px")};
   font-weight: normal;
+
+  ${breakpoint("mobile", "tablet")`
+    ${(props: { $round?: boolean }) =>
+      props.$round && `border-radius: ${MOBILE_TOUCH_TARGET / 2}px;`}
+  `};
   align-items: center;
   overflow: hidden;
   background: ${s("background")};
 
   /* Prevents an issue where input placeholder appears in a selected style when double clicking title bar */
   user-select: none;
+`;
+
+const CharacterCount = styled.span<{ $warning?: boolean }>`
+  position: absolute;
+  top: 0;
+  inset-inline-end: 0;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-start-start-radius: 0;
+  border-start-end-radius: 0;
+  border-end-end-radius: 0;
+  border-end-start-radius: 2px;
+  background: ${(props) =>
+    props.$warning ? props.theme.warning : props.theme.inputBorder};
+  color: ${(props) =>
+    props.$warning ? props.theme.white : props.theme.textTertiary};
+  pointer-events: none;
 `;
 
 export const LabelText = styled.div`
@@ -141,6 +176,18 @@ export interface Props extends Omit<
   prefix?: React.ReactNode;
   /** Optional icon that appears inside the input before the textarea */
   icon?: React.ReactNode;
+  /** Show a character count near the maxLength limit. Always shown for textareas, opt-in for other types. */
+  showCharacterCount?: boolean;
+  /** An optional soft limit below maxLength. When the value exceeds this, the character count is shown in a warning color. */
+  warningLimit?: number;
+  /** For textareas, grow the height to fit content. Use with `maxHeight` to cap the growth. */
+  autoSize?: boolean;
+  /** Minimum height of the textarea as a CSS length value (e.g. "3lh", "80px"). */
+  minHeight?: string;
+  /** Maximum height of the textarea as a CSS length value (e.g. "20lh", "400px"). */
+  maxHeight?: string;
+  /** Whether to use a round border-radius (16px) instead of the default (4px). */
+  round?: boolean;
   /** Like autoFocus, but also select any text in the input */
   autoSelect?: boolean;
   /** Callback is triggered with the CMD+Enter keyboard combo */
@@ -152,11 +199,28 @@ export interface Props extends Omit<
 }
 
 function Input(
-  props: Props,
-  ref: React.RefObject<HTMLInputElement | HTMLTextAreaElement>
+  props: Props & { ref?: React.Ref<HTMLInputElement | HTMLTextAreaElement> }
 ) {
-  const internalRef = React.useRef<HTMLInputElement | HTMLTextAreaElement>();
+  const internalRef = React.useRef<
+    HTMLInputElement | HTMLTextAreaElement | null
+  >(null);
+  const generatedId = React.useId();
   const [focused, setFocused] = React.useState(false);
+  const [charCount, setCharCount] = React.useState(() => {
+    if (typeof props.value === "string") {
+      return props.value.length;
+    }
+    if (typeof props.defaultValue === "string") {
+      return props.defaultValue.length;
+    }
+    return 0;
+  });
+
+  React.useEffect(() => {
+    if (typeof props.value === "string") {
+      setCharCount(props.value.length);
+    }
+  }, [props.value]);
 
   const handleBlur = (ev: React.SyntheticEvent) => {
     setFocused(false);
@@ -171,6 +235,15 @@ function Input(
 
     if (props.onFocus) {
       props.onFocus(ev);
+    }
+  };
+
+  const handleChange = (
+    ev: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>
+  ) => {
+    setCharCount(ev.target.value.length);
+    if (props.onChange) {
+      props.onChange(ev);
     }
   };
 
@@ -205,57 +278,104 @@ function Input(
     short,
     flex,
     prefix,
+    round,
     labelHidden,
+    maxLength,
+    showCharacterCount,
+    warningLimit,
+    autoSize,
+    minHeight,
+    maxHeight,
     onFocus,
     onBlur,
+    onChange,
     onRequestSubmit,
     children,
+    ref,
+    id = generatedId,
     ...rest
   } = props;
 
+  const showCharCount =
+    (type === "textarea" || showCharacterCount) &&
+    maxLength !== undefined &&
+    (charCount >= maxLength * 0.9 ||
+      (warningLimit !== undefined && charCount >= warningLimit));
+
+  const overWarningLimit =
+    warningLimit !== undefined && charCount > warningLimit;
+
   const wrappedLabel = <LabelText>{label}</LabelText>;
+
+  // Ensure the control always has an accessible name. When no visible or
+  // visually-hidden label is provided, fall back to the placeholder text so
+  // that screen readers announce a persistent name for the field. A caller
+  // supplied aria-label/aria-labelledby (spread via rest) still takes
+  // precedence over this fallback.
+  const fallbackAriaLabel =
+    !label && typeof props.placeholder === "string"
+      ? props.placeholder
+      : undefined;
 
   return (
     <Wrapper className={className} short={short} flex={flex}>
-      <label>
+      <label htmlFor={id}>
         {label &&
           (labelHidden ? (
             <VisuallyHidden.Root>{wrappedLabel}</VisuallyHidden.Root>
           ) : (
             wrappedLabel
           ))}
-        <Outline $focused={focused} margin={margin}>
+        <Outline $focused={focused} $round={round} margin={margin}>
           {prefix}
           {icon && <IconWrapper>{icon}</IconWrapper>}
           {type === "textarea" ? (
             <NativeTextarea
               ref={mergeRefs([
-                internalRef,
-                ref as React.RefObject<HTMLTextAreaElement>,
+                internalRef as React.Ref<HTMLTextAreaElement>,
+                ref as React.Ref<HTMLTextAreaElement>,
               ])}
               onBlur={handleBlur}
               onFocus={handleFocus}
               hasIcon={!!icon}
               hasPrefix={!!prefix}
+              $autoSize={autoSize}
+              $minHeight={minHeight}
+              $maxHeight={maxHeight}
+              aria-label={fallbackAriaLabel}
               {...rest}
-              // set it after "rest" to override "onKeyDown" from prop.
+              id={id}
+              // set it after "rest" to override props from spread.
+              maxLength={maxLength}
               onKeyDown={handleKeyDown}
+              onChange={handleChange}
             />
           ) : (
             <NativeInput
               ref={mergeRefs([
-                internalRef,
-                ref as React.RefObject<HTMLInputElement>,
+                internalRef as React.Ref<HTMLInputElement>,
+                ref as React.Ref<HTMLInputElement>,
               ])}
               onBlur={handleBlur}
               onFocus={handleFocus}
               hasIcon={!!icon}
               hasPrefix={!!prefix}
               type={type}
+              aria-label={fallbackAriaLabel}
               {...rest}
-              // set it after "rest" to override "onKeyDown" from prop.
+              id={id}
+              // set it after "rest" to override "onKeyDown" and "onChange" from prop.
+              maxLength={maxLength}
               onKeyDown={handleKeyDown}
+              onChange={handleChange}
             />
+          )}
+          {showCharCount && (
+            <Fade>
+              <CharacterCount $warning={overWarningLimit}>
+                {charCount}/{maxLength}
+              </CharacterCount>
+            </Fade>
           )}
           {children}
         </Outline>
@@ -277,4 +397,4 @@ export const TextWrapper = styled.span`
   margin-top: -16px;
 `;
 
-export default React.forwardRef(Input);
+export default Input;

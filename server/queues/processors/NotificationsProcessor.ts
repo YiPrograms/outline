@@ -1,4 +1,5 @@
 import type {
+  AccessRequestEvent,
   CollectionEvent,
   RevisionEvent,
   Event,
@@ -8,6 +9,7 @@ import type {
   DocumentUserEvent,
   DocumentGroupEvent,
   CommentReactionEvent,
+  GroupUserEvent,
 } from "@server/types";
 import CollectionAddUserNotificationsTask from "../tasks/CollectionAddUserNotificationsTask";
 import CollectionCreatedNotificationsTask from "../tasks/CollectionCreatedNotificationsTask";
@@ -15,10 +17,13 @@ import CommentCreatedNotificationsTask from "../tasks/CommentCreatedNotification
 import CommentUpdatedNotificationsTask from "../tasks/CommentUpdatedNotificationsTask";
 import ReactionCreatedNotificationsTask from "../tasks/ReactionCreatedNotificationsTask";
 import ReactionRemovedNotificationsTask from "../tasks/ReactionRemovedNotificationsTask";
+import DocumentAccessRequestNotificationsTask from "../tasks/DocumentAccessRequestNotificationsTask";
 import DocumentAddGroupNotificationsTask from "../tasks/DocumentAddGroupNotificationsTask";
 import DocumentAddUserNotificationsTask from "../tasks/DocumentAddUserNotificationsTask";
 import DocumentPublishedNotificationsTask from "../tasks/DocumentPublishedNotificationsTask";
+import GroupUserNotificationsTask from "../tasks/GroupUserNotificationsTask";
 import RevisionCreatedNotificationsTask from "../tasks/RevisionCreatedNotificationsTask";
+import ShareSubscriptionNotificationsTask from "../tasks/ShareSubscriptionNotificationsTask";
 import BaseProcessor from "./BaseProcessor";
 
 export default class NotificationsProcessor extends BaseProcessor {
@@ -26,9 +31,12 @@ export default class NotificationsProcessor extends BaseProcessor {
     "documents.publish",
     "documents.add_user",
     "documents.add_group",
+    "access_requests.create",
     "revisions.create",
     "collections.create",
     "collections.add_user",
+    "groups.add_user",
+    "groups.remove_user",
     "comments.create",
     "comments.update",
     "comments.add_reaction",
@@ -43,12 +51,17 @@ export default class NotificationsProcessor extends BaseProcessor {
         return this.documentAddUser(event);
       case "documents.add_group":
         return this.documentAddGroup(event);
+      case "access_requests.create":
+        return this.documentAccessRequest(event);
       case "revisions.create":
         return this.revisionCreated(event);
       case "collections.create":
         return this.collectionCreated(event);
       case "collections.add_user":
         return this.collectionAddUser(event);
+      case "groups.add_user":
+      case "groups.remove_user":
+        return this.groupUserChanged(event);
       case "comments.create":
         return this.commentCreated(event);
       case "comments.update":
@@ -71,7 +84,7 @@ export default class NotificationsProcessor extends BaseProcessor {
   }
 
   async documentAddUser(event: DocumentUserEvent) {
-    if (!event.data.isNew || event.userId === event.actorId) {
+    if (!event.data?.isNew || event.userId === event.actorId) {
       return;
     }
     await new DocumentAddUserNotificationsTask().schedule(event);
@@ -84,8 +97,13 @@ export default class NotificationsProcessor extends BaseProcessor {
     await new DocumentAddGroupNotificationsTask().schedule(event);
   }
 
+  async documentAccessRequest(event: AccessRequestEvent) {
+    await new DocumentAccessRequestNotificationsTask().schedule(event);
+  }
+
   async revisionCreated(event: RevisionEvent) {
     await new RevisionCreatedNotificationsTask().schedule(event);
+    await new ShareSubscriptionNotificationsTask().schedule(event);
   }
 
   async collectionCreated(event: CollectionEvent) {
@@ -101,11 +119,19 @@ export default class NotificationsProcessor extends BaseProcessor {
   }
 
   async collectionAddUser(event: CollectionUserEvent) {
-    if (!event.data.isNew || event.userId === event.actorId) {
+    if (!event.data?.isNew || event.userId === event.actorId) {
       return;
     }
 
     await new CollectionAddUserNotificationsTask().schedule(event);
+  }
+
+  async groupUserChanged(event: GroupUserEvent) {
+    if (event.userId === event.actorId) {
+      return;
+    }
+
+    await new GroupUserNotificationsTask().schedule(event);
   }
 
   async commentCreated(event: CommentEvent) {

@@ -1,6 +1,6 @@
-import isArray from "lodash/isArray";
-import sortBy from "lodash/sortBy";
-import { action, observable } from "mobx";
+import { isArray, sortBy } from "es-toolkit/compat";
+import { action, makeObservable, observable, runInAction } from "mobx";
+import type { IObservableArray } from "mobx";
 import type Team from "~/models/Team";
 import type User from "~/models/User";
 import type { LazyComponent } from "~/components/LazyLoad";
@@ -117,7 +117,8 @@ export class PluginManager {
    * @returns A list of plugins
    */
   public static getHooks<T extends Hook>(type: T) {
-    return sortBy(this.plugins.get(type) || [], "priority") as Plugin<T>[];
+    const plugins = this.plugins.get(type) ?? [];
+    return sortBy([...plugins], "priority") as Plugin<T>[];
   }
 
   /**
@@ -143,14 +144,28 @@ export class PluginManager {
 
     const r = import.meta.glob("../../plugins/*/client/index.{ts,js,tsx,jsx}");
     await Promise.all(Object.keys(r).map((key: string) => r[key]()));
-    this.loaded = true;
+    runInAction(() => {
+      this.loaded = true;
+    });
   }
 
-  private static plugins = observable.map<Hook, Plugin<Hook>[]>();
+  /**
+   * Whether all plugin client modules have finished loading.
+   */
+  public static get isLoaded(): boolean {
+    return this.loaded;
+  }
+
+  private static plugins = observable.map<
+    Hook,
+    IObservableArray<Plugin<Hook>>
+  >();
 
   @observable
   private static loaded = false;
 }
+
+makeObservable(PluginManager);
 
 /**
  * Convenience hook to get the value for a specific plugin and type.

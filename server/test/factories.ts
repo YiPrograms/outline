@@ -1,11 +1,11 @@
 import { faker } from "@faker-js/faker";
-import isNil from "lodash/isNil";
-import isNull from "lodash/isNull";
+import { isNil, isNull } from "es-toolkit/compat";
 import { Node } from "prosemirror-model";
 import type { InferCreationAttributes } from "sequelize";
 import type { DeepPartial } from "utility-types";
 import { randomUUID } from "node:crypto";
 import { randomString } from "@shared/random";
+import { Hour } from "@shared/utils/time";
 import type { ProsemirrorData, ReactionSummary } from "@shared/types";
 import {
   CollectionPermission,
@@ -14,6 +14,7 @@ import {
   ImportState,
   IntegrationService,
   IntegrationType,
+  MentionType,
   NotificationEventType,
   SubscriptionType,
   UserRole,
@@ -52,6 +53,7 @@ import {
   Template,
 } from "@server/models";
 import { RelationshipType } from "@server/models/Relationship";
+import { SearchQuerySource } from "@server/models/SearchQuery";
 import AttachmentHelper from "@server/models/helpers/AttachmentHelper";
 import { hash } from "@server/utils/crypto";
 import { OAuthInterface } from "@server/utils/oauth/OAuthInterface";
@@ -145,6 +147,19 @@ export async function buildSubscription(overrides: Partial<Subscription> = {}) {
     event: SubscriptionType.Document,
     ...overrides,
   });
+}
+
+/**
+ * Builds a random team subdomain that is unique across parallel test files.
+ *
+ * @returns a valid, unique subdomain string.
+ */
+export function buildSubdomain() {
+  return `${faker.word.noun().toLowerCase()}-${randomString({
+    length: 8,
+    charset: "alphanumeric",
+    capitalization: "lowercase",
+  })}`;
 }
 
 export function buildTeam(
@@ -323,6 +338,27 @@ export async function buildCollection(
   });
 }
 
+/**
+ * Build the personal collection of a user.
+ *
+ * @param owner The user that owns the collection.
+ * @param overrides Attributes to set on the collection.
+ * @returns the personal collection.
+ */
+export async function buildPersonalCollection(
+  owner: User,
+  overrides: Partial<Collection> = {}
+) {
+  return buildCollection({
+    name: "Personal",
+    ...overrides,
+    teamId: owner.teamId,
+    userId: owner.id,
+    ownerId: owner.id,
+    permission: null,
+  });
+}
+
 export async function buildGroup(
   overrides: Partial<Group> & { userId?: string } = {}
 ) {
@@ -373,15 +409,7 @@ export async function buildDraftDocument(
 }
 
 export async function buildDocument(
-  // Omission first, addition later?
-  // This is actually a workaround to allow
-  // passing collectionId as null. Ideally, it
-  // should be updated in the Document model itself
-  // but that'd cascade and require further changes
-  // beyond the scope of what's required now
-  overrides: Omit<Partial<Document>, "collectionId"> & { userId?: string } & {
-    collectionId?: string | null;
-  } = {}
+  overrides: Partial<Document> & { userId?: string } = {}
 ) {
   if (!overrides.teamId) {
     const team = await buildTeam();
@@ -468,6 +496,7 @@ export async function buildTemplate(
       lastModifiedById: overrides.userId,
       createdById: overrides.userId,
       editorVersion: "12.0.0",
+      publishedAt: new Date(),
       ...overrides,
     },
     {
@@ -484,29 +513,35 @@ export async function buildComment(overrides: {
   parentCommentId?: string;
   resolvedById?: string;
   reactions?: ReactionSummary[];
+  createdAt?: Date;
 }) {
-  const comment = await Comment.create({
-    resolvedById: overrides.resolvedById,
-    parentCommentId: overrides.parentCommentId,
-    documentId: overrides.documentId,
-    data: {
-      type: "doc",
-      content: [
-        {
-          type: "paragraph",
-          content: [
-            {
-              content: [],
-              type: "text",
-              text: "test",
-            },
-          ],
-        },
-      ],
+  const comment = await Comment.create(
+    {
+      resolvedById: overrides.resolvedById,
+      parentCommentId: overrides.parentCommentId,
+      documentId: overrides.documentId,
+      data: {
+        type: "doc",
+        content: [
+          {
+            type: "paragraph",
+            content: [
+              {
+                content: [],
+                type: "text",
+                text: "test",
+              },
+            ],
+          },
+        ],
+      },
+      createdById: overrides.userId,
+      reactions: overrides.reactions,
+      createdAt: overrides.createdAt,
+      updatedAt: overrides.createdAt,
     },
-    createdById: overrides.userId,
-    reactions: overrides.reactions,
-  });
+    { silent: overrides.createdAt ? true : false }
+  );
 
   return comment;
 }
@@ -570,18 +605,25 @@ export async function buildImport(overrides: Partial<Import<any>> = {}) {
     overrides.integrationId = integration.id;
   }
 
+  // Skip BeforeCreate hooks so tests can seed multiple imports per team. The
+  // production "one in-progress import per team" rule is enforced by the
+  // Import.checkInProgress hook; tests don't need to abide by it.
   // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-  return Import.create<Import<any>>({
-    name: "testImport",
-    service: IntegrationService.Notion,
-    state: ImportState.Created,
-    input: [
-      {
-        permission: CollectionPermission.Read,
-      },
-    ],
-    ...overrides,
-  });
+  return Import.create<Import<any>>(
+    {
+      name: "testImport",
+      service: IntegrationService.Notion,
+      state: ImportState.Created,
+      input: [
+        {
+          permission: CollectionPermission.Read,
+        },
+      ],
+      ...overrides,
+      // oxlint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any,
+    { hooks: false }
+  );
 }
 
 export async function buildAttachment(
@@ -600,7 +642,7 @@ export async function buildAttachment(
     overrides.userId = user.id;
   }
 
-  if (!overrides.documentId) {
+  if (overrides.documentId === undefined) {
     const document = await buildDocument({
       teamId: overrides.teamId,
       userId: overrides.userId,
@@ -615,13 +657,42 @@ export async function buildAttachment(
     id,
     key: AttachmentHelper.getKey({ id, name, userId: overrides.userId }),
     contentType: "image/png",
-    size: 100,
+    size: 1_000_000,
     acl,
     name,
     createdAt: new Date("2018-01-02T00:00:00.000Z"),
     updatedAt: new Date("2018-01-02T00:00:00.000Z"),
     ...overrides,
   });
+}
+
+/**
+ * Build a collection holding one document that references one attachment,
+ * along with a file operation to export it with.
+ *
+ * @param overrides Optional team and user to build the records under.
+ * @returns the created collection, document, attachment and file operation.
+ */
+export async function buildDocumentWithAttachment(
+  overrides: { teamId?: string; userId?: string } = {}
+) {
+  const teamId = overrides.teamId ?? (await buildTeam()).id;
+  const userId = overrides.userId ?? (await buildUser({ teamId })).id;
+
+  const collection = await buildCollection({ teamId, createdById: userId });
+  const attachment = await buildAttachment({ teamId, userId });
+  const document = await buildDocument({
+    teamId,
+    userId,
+    collectionId: collection.id,
+    title: "Test",
+    text: `![image](${attachment.redirectUrl})`,
+  });
+  await collection.addDocumentToStructure(document);
+
+  const fileOperation = await buildFileOperation({ teamId, userId });
+
+  return { collection, document, attachment, fileOperation };
 }
 
 export async function buildEmoji(
@@ -643,6 +714,7 @@ export async function buildEmoji(
     const attachment = await buildAttachment({
       teamId: overrides.teamId,
       userId: overrides.createdById,
+      documentId: null,
       contentType: "image/png",
     });
     overrides.attachmentId = attachment.id;
@@ -750,7 +822,7 @@ export async function buildSearchQuery(
   }
 
   if (!overrides.source) {
-    overrides.source = "app";
+    overrides.source = SearchQuerySource.App;
   }
 
   if (isNil(overrides.query)) {
@@ -788,14 +860,14 @@ export async function buildPin(overrides: Partial<Pin> = {}): Promise<Pin> {
 }
 
 export async function buildOAuthClient(overrides: Partial<OAuthClient> = {}) {
-  if (!overrides.teamId) {
+  if (overrides.teamId === undefined) {
     const team = await buildTeam();
     overrides.teamId = team.id;
   }
 
   if (!overrides.createdById && overrides.createdById !== null) {
     const user = await buildUser({
-      teamId: overrides.teamId,
+      teamId: overrides.teamId ?? undefined,
     });
     overrides.createdById = user.id;
   }
@@ -803,7 +875,7 @@ export async function buildOAuthClient(overrides: Partial<OAuthClient> = {}) {
   return OAuthClient.create(
     {
       name: faker.company.name(),
-      description: faker.lorem.paragraph(),
+      description: faker.lorem.sentence(),
       redirectUris: ["https://example.com/oauth/callback"],
       published: true,
       ...(overrides.createdAt && !overrides.updatedAt
@@ -817,9 +889,33 @@ export async function buildOAuthClient(overrides: Partial<OAuthClient> = {}) {
   );
 }
 
-export async function buildOAuthAuthorizationCode(
-  overrides: Partial<OAuthAuthorizationCode> = {}
+/**
+ * Build an OAuth client that is identified by a client ID metadata document.
+ *
+ * @param overrides Attributes to override on the client.
+ * @returns The created OAuth client.
+ */
+export async function buildMetadataDocumentOAuthClient(
+  overrides: Partial<OAuthClient> = {}
 ) {
+  return buildOAuthClient({
+    clientId: `https://${randomUUID()}.example.com/oauth/client.json`,
+    clientType: "public",
+    published: false,
+    teamId: null,
+    createdById: null,
+    metadataExpiresAt: new Date(Date.now() + Hour.ms),
+    ...overrides,
+  });
+}
+
+export async function buildOAuthAuthorizationCode({
+  code = randomString(32),
+  ...overrides
+}: Partial<OAuthAuthorizationCode> & {
+  /** The plaintext code, used to exchange the code in a test. */
+  code?: string;
+} = {}) {
   if (!overrides.userId) {
     const user = await buildUser();
     overrides.userId = user.id;
@@ -828,8 +924,6 @@ export async function buildOAuthAuthorizationCode(
   if (!overrides.expiresAt) {
     overrides.expiresAt = new Date();
   }
-
-  const code = randomString(32);
 
   let client;
   if (overrides.oauthClientId) {
@@ -903,6 +997,25 @@ export function buildProseMirrorDoc(content: DeepPartial<ProsemirrorData>[]) {
     type: "doc",
     content,
   });
+}
+
+export function buildMention(overrides: {
+  type?: MentionType;
+  modelId: string;
+  actorId: string;
+  label?: string;
+  id?: string;
+}): DeepPartial<ProsemirrorData> {
+  return {
+    type: "mention",
+    attrs: {
+      id: overrides.id ?? randomUUID(),
+      type: overrides.type ?? MentionType.User,
+      label: overrides.label ?? faker.person.fullName(),
+      modelId: overrides.modelId,
+      actorId: overrides.actorId,
+    },
+  };
 }
 
 export function buildCommentMark(overrides: {

@@ -23,9 +23,8 @@ describe("#views.list", () => {
       documentId: document.id,
       userId: user.id,
     });
-    const res = await server.post("/api/views.list", {
+    const res = await server.post("/api/views.list", user, {
       body: {
-        token: user.getJwtToken(),
         documentId: document.id,
       },
     });
@@ -33,6 +32,65 @@ describe("#views.list", () => {
     expect(res.status).toEqual(200);
     expect(body.data[0].count).toBe(1);
     expect(body.data[0].user.name).toBe(user.name);
+  });
+
+  it("should default to a limit of 100", async () => {
+    const user = await buildUser();
+    const document = await buildDocument({
+      userId: user.id,
+      teamId: user.teamId,
+    });
+    const res = await server.post("/api/views.list", user, {
+      body: {
+        documentId: document.id,
+      },
+    });
+    const body = await res.json();
+    expect(res.status).toEqual(200);
+    expect(body.pagination.limit).toBe(100);
+  });
+
+  it("should paginate views", async () => {
+    const team = await buildTeam();
+    const user = await buildUser({ teamId: team.id });
+    const document = await buildDocument({ userId: user.id, teamId: team.id });
+    const viewers = await Promise.all([
+      buildUser({ teamId: team.id }),
+      buildUser({ teamId: team.id }),
+      buildUser({ teamId: team.id }),
+    ]);
+    for (const viewer of viewers) {
+      await View.incrementOrCreate(createContext({ user: viewer }), {
+        documentId: document.id,
+        userId: viewer.id,
+      });
+    }
+
+    const res = await server.post("/api/views.list", user, {
+      body: {
+        documentId: document.id,
+        limit: 2,
+      },
+    });
+    const body = await res.json();
+    expect(res.status).toEqual(200);
+    expect(body.data.length).toBe(2);
+
+    const nextRes = await server.post("/api/views.list", user, {
+      body: {
+        documentId: document.id,
+        limit: 2,
+        offset: 2,
+      },
+    });
+    const nextBody = await nextRes.json();
+    expect(nextRes.status).toEqual(200);
+    expect(nextBody.data.length).toBe(1);
+
+    const ids = [...body.data, ...nextBody.data].map(
+      (view: { id: string }) => view.id
+    );
+    expect(new Set(ids).size).toBe(3);
   });
 
   it("should not return views for suspended user by default", async () => {
@@ -47,9 +105,8 @@ describe("#views.list", () => {
 
     await user.update({ suspendedAt: new Date() });
 
-    const res = await server.post("/api/views.list", {
+    const res = await server.post("/api/views.list", admin, {
       body: {
-        token: admin.getJwtToken(),
         documentId: document.id,
       },
     });
@@ -82,9 +139,8 @@ describe("#views.list", () => {
       documentId: document.id,
       userId: user.id,
     });
-    const res = await server.post("/api/views.list", {
+    const res = await server.post("/api/views.list", user, {
       body: {
-        token: user.getJwtToken(),
         documentId: document.id,
       },
     });
@@ -109,9 +165,8 @@ describe("#views.list", () => {
   it("should require authorization", async () => {
     const document = await buildDocument();
     const user = await buildUser();
-    const res = await server.post("/api/views.list", {
+    const res = await server.post("/api/views.list", user, {
       body: {
-        token: user.getJwtToken(),
         documentId: document.id,
       },
     });
@@ -126,9 +181,8 @@ describe("#views.create", () => {
       userId: user.id,
       teamId: user.teamId,
     });
-    const res = await server.post("/api/views.create", {
+    const res = await server.post("/api/views.create", user, {
       body: {
-        token: user.getJwtToken(),
         documentId: document.id,
       },
     });
@@ -157,9 +211,8 @@ describe("#views.create", () => {
       userId: user.id,
       permission: CollectionPermission.Read,
     });
-    const res = await server.post("/api/views.create", {
+    const res = await server.post("/api/views.create", user, {
       body: {
-        token: user.getJwtToken(),
         documentId: document.id,
       },
     });
@@ -183,9 +236,8 @@ describe("#views.create", () => {
   it("should require authorization", async () => {
     const document = await buildDocument();
     const user = await buildUser();
-    const res = await server.post("/api/views.create", {
+    const res = await server.post("/api/views.create", user, {
       body: {
-        token: user.getJwtToken(),
         documentId: document.id,
       },
     });

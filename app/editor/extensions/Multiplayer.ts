@@ -1,15 +1,25 @@
-import isEqual from "lodash/isEqual";
+import type { HocuspocusProvider } from "@hocuspocus/provider";
+import { isEqual } from "es-toolkit/compat";
 import { Plugin } from "prosemirror-state";
 import {
   ySyncPlugin,
+  ySyncPluginKey,
   yCursorPlugin,
   yUndoPlugin,
+  yUndoPluginKey,
   undo,
   redo,
+  undoCommand,
+  redoCommand,
 } from "y-prosemirror";
 import * as Y from "yjs";
 import Extension from "@shared/editor/lib/Extension";
-import { isRemoteTransaction } from "@shared/editor/lib/multiplayer";
+import type { MultiplayerOperations } from "@shared/editor/lib/multiplayer";
+import {
+  isRemoteTransaction,
+  multiplayerPluginKey,
+} from "@shared/editor/lib/multiplayer";
+import { EditorStyleHelper } from "@shared/editor/styles/EditorStyleHelper";
 import { Second } from "@shared/utils/time";
 
 type UserAwareness = {
@@ -20,7 +30,19 @@ type UserAwareness = {
   head: object;
 };
 
-export default class Multiplayer extends Extension {
+/**
+ * Options for the Multiplayer extension.
+ */
+type MultiplayerOptions = {
+  /** The local user, used for cursor presence and the persistent user/client mapping. */
+  user: { id: string; color: string };
+  /** The Hocuspocus provider used for awareness and document sync. */
+  provider: HocuspocusProvider;
+  /** The shared Yjs document this editor is bound to. */
+  document: Y.Doc;
+};
+
+export default class Multiplayer extends Extension<MultiplayerOptions> {
   get name() {
     return "multiplayer";
   }
@@ -92,7 +114,7 @@ export default class Multiplayer extends Extension {
 
       return {
         style: `background-color: ${u.color}${opacity}`,
-        class: "ProseMirror-yjs-selection",
+        class: EditorStyleHelper.multiplayerSelection,
       };
     };
 
@@ -102,6 +124,18 @@ export default class Multiplayer extends Extension {
     // mapping, this avoids stored mappings for clients that never made a change
     doc.on("afterTransaction", assignUser);
 
+    const multiplayer: MultiplayerOperations = {
+      isRemoteTransaction: (tr) => {
+        const meta = tr.getMeta(ySyncPluginKey);
+
+        // This logic seems to be flipped? But it's correct.
+        return !!meta?.isChangeOrigin;
+      },
+      stopCapturing: (state) => {
+        yUndoPluginKey.getState(state)?.undoManager?.stopCapturing();
+      },
+    };
+
     return [
       ySyncPlugin(type),
       yCursorPlugin(provider.awareness, {
@@ -109,9 +143,14 @@ export default class Multiplayer extends Extension {
         selectionBuilder,
       }),
       yUndoPlugin(),
+      // Facade plugin that exposes the collaboration operations to shared
+      // code without a static dependency on the collaboration libraries.
       new Plugin({
+        key: multiplayerPluginKey,
+        multiplayer,
         props: {
-          handleScrollToSelection: (view) => isRemoteTransaction(view.state.tr),
+          handleScrollToSelection: (view) =>
+            isRemoteTransaction(view.state.tr, view.state),
         },
       }),
     ];
@@ -121,6 +160,14 @@ export default class Multiplayer extends Extension {
     return {
       undo: () => undo,
       redo: () => redo,
+    };
+  }
+
+  keys() {
+    return {
+      "Mod-z": undoCommand,
+      "Mod-y": redoCommand,
+      "Shift-Mod-z": redoCommand,
     };
   }
 }
